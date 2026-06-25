@@ -1,97 +1,34 @@
-name: Scrape LibyanJobs
+name: Scraper
 on:
   schedule:
-    # 06:00 UTC daily (= 08:00 Africa/Tripoli). Adjust as needed.
-    - cron: "0 6 * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch:
-    inputs:
-      max_pages:
-        description: "Archive pages to crawl"
-        required: false
-        default: "20"
-      use_playwright:
-        description: "Force Playwright fetch (1=yes, 0=no)"
-        required: false
-        default: "1"
-      require_public_apply:
-        description: "Only post jobs with a public apply email/URL (1=on)"
-        required: false
-        default: "1"
-
-# Never let two scraper runs overlap (avoids double-posting to WordPress).
-concurrency:
-  group: scrape-libya
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-
 jobs:
   scrape:
-    # ⬇️  Switch to [self-hosted, linux] for a residential IP (see caveat above).
     runs-on: ubuntu-latest
-   
-    env:
-      # ── Non-secret config (override per-run via workflow_dispatch inputs) ──
-      LIBYANJOBS_JOBS_URL:  "https://libyanjobs.ly/jobs/"
-      MAX_PAGES:            ${{ github.event.inputs.max_pages || '20' }}
-      USE_PLAYWRIGHT:       ${{ github.event.inputs.use_playwright || '1' }}
-      REQUIRE_PUBLIC_APPLY: ${{ github.event.inputs.require_public_apply || '1' }}
-      REQUEST_DELAY:        "1.5"
-
-      # ── Secrets — set these under Settings → Secrets and variables → Actions ──
-      WP_BASE_URL:     ${{ secrets.WP_BASE_URL }}      # e.g. https://jobs.dataaxisnode.com/<site>/wp-json/wp/v2
-      WP_USERNAME:     ${{ secrets.WP_USERNAME }}      # the job-scrarper account (not admin)
-      WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}  # WordPress Application Password
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}  # optional; paraphrase skipped if unset
-
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-
+          cache: "pip"
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # Browser binary for Playwright. `--with-deps` installs system libs via apt
-      # (works on the ubuntu-latest hosted runner; drop it on a self-hosted Arch
-      # runner and install the libs through pacman / once by hand instead).
-      - name: Install Playwright Chromium
-        if: ${{ env.USE_PLAYWRIGHT == '1' }}
-        run: python -m playwright install --with-deps chromium
-
-      # Restore the most recent de-dup tracker so we don't re-post old jobs.
-      # Rolling cache: unique key each run (always saves), prefix restore-key
-      # pulls the latest previous state.
-      - name: Restore scraper state
-        uses: actions/cache@v4
-        with:
-          path: |
-            libyanjobs_libya_processed.csv
-            libyanjobs_libya_flagged.csv
-          key: libyajobs-state-${{ github.run_id }}
-          restore-keys: |
-            libyajobs-state-
-
+        run: pip install -r requirements.txt
       - name: Run scraper
+        env:
+          MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
+          WP_USERNAME:      ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
+          WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
         run: python ly.py
-
-      # Make the Excel + flagged CSV downloadable from the run summary.
-      - name: Upload outputs
-        if: ${{ always() }}
+      - name: Upload Excel output as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: libya-jobs-output
+          name: jobs-output-${{ github.run_id }}
           path: |
-            libyanjobs_libya_jobs.xlsx
-            libyanjobs_libya_flagged.csv
-            libyanjobs_libya_processed.csv
-          if-no-files-found: ignore
-          retention-days: 14
+            jobs_output.xlsx
+            processed_jobs.csv
+          retention-days: 7
