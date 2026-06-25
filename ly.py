@@ -1,35 +1,29 @@
-import os
 import re
-import csv
-import sys
 import time
-import json
-import atexit
 import base64
+import json
 import hashlib
 import logging
+import os
 from datetime import datetime, timedelta
-from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urlparse, unquote, quote_plus
 
 import requests
 from bs4 import BeautifulSoup
+import openpyxl
+import pandas as pd
 
 # Optional: load secrets from a local .env file if python-dotenv is installed.
+# This is silent/no-op if the package or file isn't present.
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Optional heavy deps used for Excel export only.
-try:
-    import pandas as pd
-    import openpyxl
-    _XLSX_AVAILABLE = True
-except ImportError:
-    _XLSX_AVAILABLE = False
-
-# Optional heavy deps used for paraphrase quality gating.
+# ─────────────────────────────────────────────────────────────────────────────
+#  OPTIONAL heavy deps
+# ─────────────────────────────────────────────────────────────────────────────
 try:
     import language_tool_python
     from sentence_transformers import SentenceTransformer, util as st_util
@@ -37,91 +31,38 @@ try:
 except ImportError:
     _NLP_AVAILABLE = False
 
-# Optional: Playwright, used only as a fallback when the site's bot detection
-# blocks plain requests (see get_soup). Toggle on hard with USE_PLAYWRIGHT=1.
-try:
-    from playwright.sync_api import sync_playwright
-    _PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    _PLAYWRIGHT_AVAILABLE = False
-
 # =============================================================================
 #  CONFIG
 # =============================================================================
-#
-#  SOURCE
-#  ------
-#  https://libyanjobs.ly/jobs/  -> REAL source (scraped here). It runs the NOO
-#  JobMonster WordPress theme — the SAME theme family as GamJobs (Gambia) — so the
-#  structure is shared: a paginated /jobs/ archive of listing cards (/jobs/page/N/),
-#  each linking to a /jobs/<slug>/ detail page, with /job-type/, /job-location/ and
-#  /job-category/ taxonomy anchors. Differences from the Gambia pipeline:
-#
-#    * BILINGUAL (Arabic / English). Job types ("Full Time - دوام كامل"), locations
-#      ("Tripoli / طرابلس") and categories ("Human Resources - الموارد البشرية")
-#      arrive as Latin/Arabic pairs; we keep the Latin side. English-keyword
-#      normalisers still fire on the (overwhelmingly English) NGO/company bodies.
-#    * ISO DATES. Cards show YYYY-MM-DD, or a "posted - closing" ISO range; bodies
-#      may use "October 11, 2020" or "25th August 2021". All handled below.
-#    * /companies/ employer pages (not /employers/). Many roles are Tunis-based
-#      (Libya operations run out of Tunis), so Tunis is a recognised location.
-#    * NO government gateway step — Libya has no single clean official jobs portal,
-#      so we point straight at libyanjobs.ly.
-#    * BOT DETECTION. The site actively blocks datacentre / automated requests.
-#      Run this from a residential IP (your home box), and/or set USE_PLAYWRIGHT=1
-#      to route fetches through a real headless Chromium. get_soup also auto-falls
-#      back to Playwright on a 403/429/503 if Playwright is installed.
-#
-#  APPLY RULE (hard, network-wide)
-#  -------------------------------
-#  A job only posts if it exposes a PUBLIC apply path: an email or an external
-#  apply URL found in its body / "How to Apply" text. The on-page "Apply for this
-#  job" button just opens a login/registration modal, so it is NEVER a valid apply
-#  destination. Jobs without a public email/URL are written to the flagged CSV.
-#  REQUIRE_PUBLIC_APPLY (default "1"/on) enforces this; set to "0" to post all.
-# =============================================================================
 
-BASE_URL  = "https://libyanjobs.ly"
-JOBS_URL  = os.environ.get("LIBYANJOBS_JOBS_URL", "https://libyanjobs.ly/jobs/")
+SHEET_NAME       = "Sheet1"
+DELAY_S          = 2.0
+FETCH_CHAR_LIMIT = 120_000
 
-# Enforce the public-apply-only rule (email or external URL required to post).
-REQUIRE_PUBLIC_APPLY = os.environ.get("REQUIRE_PUBLIC_APPLY", "1") != "0"
+MAX_PAGES       = 0   # 0 = unlimited
+MAX_EMPTY_PAGES = 5
+JOB_LIMIT       = 0   # 0 = no cap
 
-# Route every fetch through Playwright (set to "1" if requests is blocked outright).
-USE_PLAYWRIGHT = os.environ.get("USE_PLAYWRIGHT", "0") != "0"
+OUTPUT_FILE        = "jobs_output.xlsx"
+PROCESSED_IDS_FILE = "processed_jobs.csv"
 
-REQUEST_DELAY   = float(os.environ.get("REQUEST_DELAY", "1.5"))
-MAX_JOBS        = int(os.environ.get("MAX_JOBS", "0"))     # 0 = unlimited
-MAX_PAGES       = int(os.environ.get("MAX_PAGES", "20"))   # archive pagination cap
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
-
-OUTPUT_FILE        = "libyanjobs_libya_jobs.xlsx"
-PROCESSED_IDS_FILE = "libyanjobs_libya_processed.csv"
-FLAGGED_FILE       = "libyanjobs_libya_flagged.csv"
-
-# CSV column names — defined once so _init_tracker, load, and upsert all agree.
-_TRACKER_FIELDS = ["Job ID", "Job URL", "Job Title", "Company Name",
-                   "Status", "Timestamp", "WP ID"]
-
-_FLAGGED_FIELDS = ["Source", "Title", "Company", "Location", "Salary",
-                   "Deadline", "Reason", "Apply Note", "Job URL", "Timestamp"]
-
-# ── WordPress ────────────────────────────────────────────────────────────────
+# ── WordPress (secrets via environment variables — see header docstring) ────
 WP_URL      = os.environ.get("WP_BASE_URL", "")
 WP_USER     = os.environ.get("WP_USERNAME", "")
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
-WP_BASE      = WP_URL.rstrip("/")
-WP_JOBS_URL  = f"{WP_BASE}/job-listings"
-WP_MEDIA_URL = f"{WP_BASE}/media"
+WP_BASE        = WP_URL.rstrip("/")
+WP_JOBS_URL    = f"{WP_BASE}/job-listings"     # ✅
+WP_COMPANY_URL = f"{WP_BASE}/companies"        # ✅
+WP_MEDIA_URL   = f"{WP_BASE}/media"
 
-# ── Mistral ──────────────────────────────────────────────────────────────────
+# ── Mistral (secret via environment variable — see header docstring) ────────
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 MISTRAL_MODEL   = "mistral-small-latest"
 MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 
-ENABLE_PARAPHRASE = True
+ENABLE_PARAPHRASE = True   # set False to skip paraphrasing entirely
 
-# ── Startup warnings ─────────────────────────────────────────────────────────
+# ── Startup checks: warn (don't crash) if secrets are missing ───────────────
 for _var, _val, _feature in [
     ("MISTRAL_API_KEY", MISTRAL_API_KEY, "paraphrasing"),
     ("WP_USERNAME",     WP_USER,         "WordPress posting"),
@@ -132,115 +73,27 @@ for _var, _val, _feature in [
             f"Environment variable {_var} is not set — {_feature} will be disabled/skipped."
         )
 
-# Bilingual job-type map. Keys are matched as substrings (see map_job_type) so
-# "Full Time - دوام كامل" and the Arabic-only forms both resolve correctly.
-JOB_TYPE_MAPPING = {
-    "full-time": "full-time", "full time": "full-time",
-    "part-time": "part-time", "part time": "part-time",
-    "contract":  "contract",  "temporary": "temporary",
-    "internship":"internship","freelance": "freelance",
-    "volunteer": "volunteer", "permanent": "full-time",
-    # Arabic
-    "دوام كامل":  "full-time",   # full time
-    "دوام جزئي":  "part-time",   # part time
-    "عقد عمل":    "contract",    # contract
-    "عقد":        "contract",
-    "مؤقت":       "temporary",   # temporary
-    "تدريب":      "internship",  # internship/training
-    "تطوع":       "volunteer",   # volunteer
-    "عمل حر":     "freelance",   # freelance
-    "دائم":       "full-time",   # permanent
-}
+# =============================================================================
+#  KEYWORDS
+# =============================================================================
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-    "Accept-Charset": "utf-8",
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
-# Known Libyan towns/cities (Latin spellings), used both to match /job-location/
-# anchors and as a fallback to pull a location from free text. Tunis is included
-# because a large share of Libya NGO roles are based out of Tunis.
-LIBYA_LOCATIONS = [
-    "Tripoli", "Benghazi", "Misrata", "Misurata", "Bayda", "Al Bayda",
-    "Zawiya", "Az Zawiyah", "Zliten", "Ajdabiya", "Tobruk", "Sabha", "Sebha",
-    "Sirte", "Khoms", "Al Khums", "Derna", "Sabratha", "Zuwara", "Murzuq",
-    "Gharyan", "Tarhuna", "Brak", "Brak Al-Shati", "Ubari", "Awbari", "Ghat",
-    "Kufra", "Jufra", "Hun", "Waddan", "Sokna", "Marj", "Al Marj", "Yefren",
-    "Nalut", "Sorman", "Bani Walid", "Tajura", "Janzour", "Ras Lanuf",
-    "Brega", "Marsa Brega", "Ghadames", "Jaghbub", "Sebratha", "Tunis",
+SEARCH_KEYWORDS = [
+    "",
+   # "engineer", "developer", "manager", "finance", "sales", "HR",
+   # "doctor", "construction", "logistics", "operations", "customer service",
+   # "teacher", "chef", "lawyer", "graphic designer", "production manager",
+   # "petroleum", "driver", "security", "researcher", "journalist",
+   # "banker", "retail", "renewable energy",
 ]
-# Country-level catch-all when no specific town is found.
-DEFAULT_LOCATION = os.environ.get("LIBYANJOBS_DEFAULT_LOCATION", "Libya")
-
-# Hosts/paths that are never a real external apply destination.
-_NON_APPLY_HOST_SUBSTR = (
-    "libyanjobs.ly", "facebook.", "twitter.", "x.com", "linkedin.",
-    "instagram.", "wa.me", "whatsapp", "t.me", "telegram",
-    "plus.google", "pinterest.", "youtube.",
-)
-_NON_APPLY_PATH_SUBSTR = (
-    "/member-2", "/members", "action=login", "mode=register", "#share",
-    "/share", "/wp-login", "/cart", "/checkout",
-)
-# Emails belonging to the board itself are never a real apply address — these
-# appear in the topbar/footer ("elmansori@libyanjobs.ly") and must not be posted
-# as the place to apply.
-_NON_APPLY_EMAIL_DOMAINS = ("libyanjobs.ly", "libyaninvestment.com")
-
-def _is_real_apply_email(email: str) -> bool:
-    if not email or "@" not in email:
-        return False
-    dom = email.rsplit("@", 1)[-1].lower()
-    return not any(dom == d or dom.endswith("." + d) for d in _NON_APPLY_EMAIL_DOMAINS)
-
-# Arabic script detector (used to strip the Arabic half of bilingual labels).
-_ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
-
-def _clean_bilingual(s: str) -> str:
-    """
-    Reduce a bilingual 'Latin / Arabic' or 'Latin - Arabic' label to its Latin
-    side. Examples:
-        'Tripoli / طرابلس'                         -> 'Tripoli'
-        'Full Time - دوام كامل'                    -> 'Full Time'
-        'Human Resources - الموارد البشرية - ...'  -> 'Human Resources'
-        'دوام كامل'                                -> ''  (no Latin part)
-    """
-    s = (s or "").strip()
-    if not s:
-        return ""
-    for sep in ("/", "|", "•", "،"):
-        if sep in s:
-            parts = [p.strip() for p in s.split(sep)]
-            latin = [p for p in parts if p and not _ARABIC_RE.search(p)]
-            if latin:
-                return latin[0]
-    # "Latin - Arabic" (spaced dash, Arabic tail) -> keep Latin head.
-    m = re.match(r"^(.*?)\s+[-–—]\s+(.*)$", s)
-    if m and _ARABIC_RE.search(m.group(2)) and not _ARABIC_RE.search(m.group(1)):
-        return m.group(1).strip()
-    cleaned = _ARABIC_RE.sub("", s)
-    cleaned = re.sub(r"\s*[-–—/|•،]\s*", " ", cleaned)   # tidy orphaned separators
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—/|•،")
-    # If nothing Latin/alphanumeric survives the strip, the label was Arabic-only:
-    # return "" (per contract) so callers fall through to their Latin-first logic
-    # instead of surfacing a raw Arabic token (which would fragment WP region terms).
-    return cleaned if re.search(r"[A-Za-z0-9]", cleaned) else ""
 
 # =============================================================================
 #  LOGGING / COLOUR
 # =============================================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log_ = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
+import sys
 _USE_COLOUR = sys.stdout.isatty()
 
 def _c(code, text):
@@ -253,87 +106,169 @@ C_DIM     = lambda t: _c("2",     t)
 C_GREEN   = lambda t: _c("1;32",  t)
 C_RED     = lambda t: _c("1;31",  t)
 C_BLUE    = lambda t: _c("1;34",  t)
-C_DIVIDER = lambda: _c("2", "─" * 80)
-
-def log(msg):
-    print(msg, flush=True)
-
-EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.+_-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
-URL_PATTERN   = re.compile(r"https?://[^\s)>\"']+", re.I)
-
-TRACKING_PARAM_PREFIXES = ("utm_",)
-TRACKING_PARAM_EXACT = {
-    "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid", "ref", "referrer",
-}
-
-MONTHS = {
-    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
-    "december": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
-    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
-}
-
-# ISO YYYY-MM-DD (primary on cards + Job Overview), incl. ranges "iso - iso".
-ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
-# Month DD, YYYY  e.g. "October 11, 2020".
-MDY_DATE_RE = re.compile(r"\b([A-Za-z]+)\s+(\d{1,2})\s*,\s*(\d{4})\b")
-# Ordinal text date e.g. "30th June 2026" / "25th August, 2021".
-TEXT_DATE_RE = re.compile(
-    r"(\d{1,2})\s*(?:st|nd|rd|th)?\s+([A-Za-z]+)\s*[.,]?\s*(\d{4})", re.I
-)
-# Numeric DD/MM/YYYY or DD-MM-YYYY (kept for safety).
-DMY_DATE_RE = re.compile(r"\b(\d{1,2})[/](\d{1,2})[/](\d{4})\b")
-
-# Labels inside the JobMonster "Job Overview" box / body deadline cues.
-DEADLINE_LABELS = ("application deadline", "closing date for applications",
-                   "closing date", "deadline for applications", "deadline",
-                   "last date to apply", "last date", "applications close",
-                   "expiry date", "expires", "due date", "apply by",
-                   "آخر موعد", "الموعد النهائي", "ينتهي")
-
-# Body headings that introduce the application instructions. Matched against a
-# *stripped, short* line (see _is_apply_heading_line) so it never trips on
-# 'Application Deadline:' / 'Application Format' or a mid-sentence 'to apply'.
-_APPLY_HEAD_PHRASES = re.compile(
-    r"^(?:how\s*(?:and|&)\s*deadline\s*to\s*apply|how\s*to\s*apply(?:\s*(?:and|&)\s*deadline)?|"
-    r"how\s*to\s*submit|to\s*apply|application\s*(?:and|&)\s*deadline|"
-    r"mode\s*of\s*application|method\s*of\s*application|"
-    r"application\s*(?:procedure|process|instructions?|method|guidelines?)|"
-    r"to\s*apply\s*for\s*this\s*(?:job|position|vacancy)|"
-    r"submission\s*of\s*applications?|deadline\s*(?:and|&)?\s*(?:how\s*)?to\s*apply)\b",
-    re.I,
-)
-# Arabic apply headings (no \b word boundaries — matched by prefix/containment).
-_APPLY_HEAD_AR = (
-    "كيفية التقديم", "طريقة التقديم", "كيفية التقدم", "آلية التقديم",
-    "للتقديم", "التقديم على الوظيفة", "كيف تتقدم",
-)
-
-# Boilerplate that marks the end of usable post content on a detail page.
-_BODY_CUT_MARKERS = [
-    "related jobs", "leave your thoughts", "you must be logged in",
-    "email me jobs like these", "send to a friend", "send to friend",
-    "company information", "leave a reply", "post a comment", "showing 1",
-    "this job has expired", "let us know your job expectations",
-    "content is protected", "you may also be interested",
-]
-# Standalone UI lines to drop from the description.
-_BODY_DROP_LINES = {
-    "apply for this job", "save", "share", "share:", "bookmark job",
-    "quick view", "send to friend", "send to a friend", "clear all",
-    "filter", "view more", "email me jobs like these",
-    "let us know your job expectations", "this job has expired!",
-    "this job has expired", "× clear all filter", "qؤdؤؤ",
-}
+C_DIVIDER = lambda: _c("2", "─" * 72)
 
 # =============================================================================
-#  TEXT CLEANUP / SANITIZATION
+#  ROTATING USER-AGENTS
+# =============================================================================
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+_ua_idx = 0
+
+def _next_headers() -> dict:
+    global _ua_idx
+    ua = USER_AGENTS[_ua_idx % len(USER_AGENTS)]
+    _ua_idx += 1
+    return {
+        "User-Agent":       ua,
+        "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language":  "en-US,en;q=0.9",
+        "Accept-Encoding":  "gzip, deflate, br",
+        "Cache-Control":    "no-cache",
+        "X-Li-Lang":        "en_US",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+HEADERS = _next_headers()
+
+# =============================================================================
+#  DOMAIN LISTS
+# =============================================================================
+
+SKIP_CRAWL_DOMAINS = [
+    "dhl.com","fedex.com","ups.com","amazon.com","amazon.jobs",
+    "google.com","microsoft.com","apple.com","meta.com","ibm.com",
+    "oracle.com","sap.com","accenture.com","deloitte.com","pwc.com",
+    "kpmg.com","ey.com","mckinsey.com","bcg.com","bain.com",
+    "citibank.com","hsbc.com","barclays.com","bnpparibas.com",
+    "airbus.com","boeing.com","siemens.com","ge.com",
+    "unilever.com","nestle.com","pg.com","shell.com","bp.com",
+]
+BAD_DOMAINS = [
+    "linkedin.com","google.com","youtube.com","facebook.com",
+    "twitter.com","x.com","instagram.com","t.co","example.com",
+    "w3.org","sentry.io","schema.org",
+]
+NOISE_EMAIL_DOMAINS = [
+    "example.com","sentry.io","google.com","w3.org",
+    "schema.org","wixpress.com","squarespace.com",
+]
+
+# Known ATS domains — always valid apply URLs
+ATS_DOMAINS = [
+    "greenhouse.io","lever.co","workday.com","bamboohr.com",
+    "smartrecruiters.com","taleo.net","icims.com","jazzhr.com",
+    "recruitee.com","workable.com","ashbyhq.com","breezy.hr",
+    "jobvite.com","pinpointhq.com","teamtailor.com","personio.de",
+    "comeet.com","rippling.com","gusto.com","ats.com",
+    "myworkdayjobs.com","ultipro.com","successfactors.com",
+    "oraclecloudhq.com","careers-page.com","applytojob.com",
+]
+
+FAKE_LOCAL_RE  = re.compile(
+    r"^(name|user|email|mail|yourname|your[-_.]?email|sample|test|info|hello"
+    r"|noreply|no[-_.]?reply|admin|webmaster|support|contact|example)$", re.I)
+FAKE_DOMAIN_RE = re.compile(
+    r"^(domain|example|yoursite|yourdomain|yourbrand|company|mycompany"
+    r"|website|yourcompany|mysite|placeholder|site)\.[a-z]{2,}$", re.I)
+
+MONTH_MAP = {
+    "jan":0,"feb":1,"mar":2,"apr":3,"may":4,"jun":5,
+    "jul":6,"aug":7,"sep":8,"oct":9,"nov":10,"dec":11,
+}
+
+JOB_TYPE_MAPPING = {
+    "full-time": "full-time", "full time": "full-time",
+    "part-time": "part-time", "part time": "part-time",
+    "contract":  "contract",  "temporary": "temporary",
+    "internship":"internship","freelance": "freelance",
+    "volunteer": "volunteer",
+}
+
+# Industry inference keywords (for company-site harvesting)
+INDUSTRY_KEYWORDS = [
+    ("Information Technology", ["software","technology","it services","tech company","saas","cloud computing","it solutions"]),
+    ("Finance & Banking", ["bank","financial services","fintech","insurance","investment","asset management"]),
+    ("Construction & Real Estate", ["construction","real estate","property development","contracting","engineering & construction"]),
+    ("Oil & Gas / Energy", ["oil and gas","petroleum","energy","renewable energy","power generation"]),
+    ("Healthcare", ["healthcare","hospital","clinic","pharmaceutical","medical"]),
+    ("Retail & E-commerce", ["retail","e-commerce","ecommerce","shopping","fmcg"]),
+    ("Manufacturing", ["manufacturing","factory","industrial","production facility"]),
+    ("Hospitality & Tourism", ["hospitality","hotel","tourism","travel agency","resort"]),
+    ("Education", ["education","school","university","training institute","academy"]),
+    ("Logistics & Transportation", ["logistics","shipping","freight","transportation","supply chain"]),
+    ("Telecommunications", ["telecom","telecommunications","mobile network","internet service provider"]),
+    ("Consulting", ["consulting","advisory","professional services"]),
+    ("Media & Entertainment", ["media","entertainment","broadcasting","publishing","advertising agency"]),
+    ("Agriculture", ["agriculture","farming","agribusiness"]),
+    ("Government & Non-Profit", ["government","ministry","non-profit","ngo","public sector"]),
+]
+
+# =============================================================================
+#  ▶▶ LINKEDIN URL FILTER
+# =============================================================================
+
+def is_linkedin_url(value: str) -> bool:
+    """Return True if the value is a LinkedIn URL (any subdomain)."""
+    if not value:
+        return False
+    return bool(re.search(r"linkedin\.com", value, re.I))
+
+def blank_if_linkedin(value: str) -> str:
+    """Return empty string if value contains a LinkedIn URL, else return as-is."""
+    return "" if is_linkedin_url(value) else value
+
+# =============================================================================
+#  v7: BAD COMPANY NAME / LOGIN-WALL HELPERS
+# =============================================================================
+
+BAD_COMPANY_NAMES = {
+    "sign in", "linkedin", "join now", "log in", "login",
+    "join linkedin", "welcome back", "",
+}
+
+def is_bad_company_name(name: str) -> bool:
+    """Detect LinkedIn login-wall placeholders masquerading as a company name."""
+    if not name:
+        return True
+    n = name.strip().lower()
+    if n in BAD_COMPANY_NAMES:
+        return True
+    if "linkedin" in n and len(n) < 30:
+        return True
+    return False
+
+def extract_company_from_job_url(job_url: str) -> str:
+    """
+    Fallback: LinkedIn job URLs are typically of the form
+        .../jobs/view/<job-title-slug>-at-<company-slug>-<numeric-id>/
+    Extract <company-slug> and turn it into a readable name.
+    """
+    if not job_url:
+        return ""
+    m = re.search(r"-at-([a-z0-9\-]+)-\d+/?(?:\?.*)?$", job_url, re.I)
+    if not m:
+        return ""
+    slug = m.group(1).replace("-", " ").strip()
+    if not slug:
+        return ""
+    # Title-case but keep common acronyms upper if all-caps in slug originally
+    return " ".join(w.upper() if len(w) <= 3 and w.isalpha() and w == w else w.title()
+                     for w in slug.split()).title()
+
+# =============================================================================
+#  MOJIBAKE / TEXT HELPERS
 # =============================================================================
 
 _MOJIBAKE = [
     ("Â", ""), ("â€™", "'"), ("â€œ", '"'), ("â€\x9d", '"'), ("â€", '"'),
     ("â€¢", "•"), ("â„¢", "™"), ("\u00a0", " "), ("\u200b", ""), ("\ufeff", ""),
-    ("\u200e", ""), ("\u200f", ""),  # LRM / RLM bidi marks
 ]
 
 def _fix_mojibake(text: str) -> str:
@@ -342,540 +277,52 @@ def _fix_mojibake(text: str) -> str:
     text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
     return text
 
-def sanitize_text(text, is_url=False) -> str:
+def sanitize_text(text, is_url=False, is_email=False) -> str:
     if not isinstance(text, str):
-        text = str(text) if (text is not None and str(text) not in ("nan", "None", "NaN")) else ""
+        text = str(text) if (text is not None and str(text) not in ("nan","None","NaN")) else ""
     text = text.strip()
     if text in ("nan", "None", "NaN", "", "N/A", "n/a", "NA", "na"):
         return ""
     text = _fix_mojibake(text)
-    if is_url:
+    if is_url or is_email:
         return re.sub(r"[ \t\r\n\f\v]+", " ", text).strip()
     text = re.sub(r"#+\s*", "", text)
     text = re.sub(r"\*\*", "", text)
+    # v7: keep Arabic ranges (U+0600-U+06FF Arabic, U+0750-U+077F Arabic Supplement)
+    # so Arabic-language job descriptions aren't reduced to stray punctuation.
+    text = re.sub(
+        r"[^\x20-\x7E\n\u00C0-\u017F\u0600-\u06FF\u0750-\u077F\u2013\u2014\u2018-\u201D\u2022]",
+        "", text
+    )
     text = re.sub(r"[ \t]+", " ", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
-def clean_text(el):
-    if el is None:
-        return ""
-    return re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
-
-def extract_email(text):
-    if not text:
-        return ""
-    m = EMAIL_PATTERN.search(text)
-    return m.group(0) if m else ""
-
-def strip_tracking_params(url):
-    if not url:
-        return url
-    parts = urlsplit(url)
-    if not parts.query:
-        return url
-    kept = []
-    for key, value in parse_qsl(parts.query, keep_blank_values=True):
-        key_lower = key.lower()
-        if key_lower.startswith(TRACKING_PARAM_PREFIXES) or key_lower in TRACKING_PARAM_EXACT:
-            continue
-        kept.append((key, value))
-    new_query = urlencode(kept)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
-
 # =============================================================================
-#  BASIC HTTP / PARSING HELPERS  (requests first, optional Playwright fallback)
+#  v7: LANGUAGE DETECTION HELPERS
 # =============================================================================
 
-_PW = {"pw": None, "browser": None, "context": None}
+_ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F]")
+_LATIN_CHAR_RE  = re.compile(r"[A-Za-z]")
 
-def _playwright_ctx():
-    if _PW["context"] is not None:
-        return _PW["context"]
-    if not _PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError(
-            "Playwright requested but not installed. "
-            "Run: pip install playwright && playwright install chromium")
-    _PW["pw"] = sync_playwright().start()
-    _PW["browser"] = _PW["pw"].chromium.launch(headless=True)
-    _PW["context"] = _PW["browser"].new_context(
-        user_agent=HEADERS["User-Agent"],
-        locale="en-US",
-        viewport={"width": 1366, "height": 900},
-    )
-    return _PW["context"]
-
-def _close_playwright():
-    try:
-        if _PW["context"]:
-            _PW["context"].close()
-        if _PW["browser"]:
-            _PW["browser"].close()
-        if _PW["pw"]:
-            _PW["pw"].stop()
-    except Exception:
-        pass
-    _PW.update({"pw": None, "browser": None, "context": None})
-
-atexit.register(_close_playwright)
-
-def _make_soup(html: str):
-    try:
-        return BeautifulSoup(html, "lxml")
-    except Exception:
-        return BeautifulSoup(html, "html.parser")
-
-def _soup_via_requests(url):
-    resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    resp.encoding = resp.encoding or "utf-8"
-    return _make_soup(resp.text)
-
-def _soup_via_playwright(url):
-    ctx = _playwright_ctx()
-    page = ctx.new_page()
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT * 1000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
-        html = page.content()
-    finally:
-        page.close()
-    return _make_soup(html)
-
-def get_soup(url):
-    """Fetch + parse. Uses Playwright if USE_PLAYWRIGHT=1, otherwise requests with
-    an automatic Playwright fallback on a block-style HTTP status."""
-    if USE_PLAYWRIGHT:
-        return _soup_via_playwright(url)
-    try:
-        return _soup_via_requests(url)
-    except requests.HTTPError as e:
-        code = getattr(getattr(e, "response", None), "status_code", None)
-        if code in (401, 403, 406, 429, 503) and _PLAYWRIGHT_AVAILABLE:
-            log_.warning(f"HTTP {code} on {url} — falling back to Playwright")
-            return _soup_via_playwright(url)
-        raise
-
-def slugify(text, maxlen=80):
-    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
-    return s[:maxlen] or "job"
-
-def html_block_to_text(el) -> str:
+def detect_text_language(text: str) -> str:
     """
-    Convert a BeautifulSoup element to readable plain text, preserving line
-    breaks for block-level tags and turning <li> into bullet lines. The block is
-    mutated in place — only ever call this on a throwaway/per-job element.
+    Very lightweight heuristic language detector for the purpose of deciding
+    whether to run the English-oriented paraphrase prompts.
+    Returns "ar" if the text is predominantly Arabic, otherwise "en".
     """
-    if el is None:
-        return ""
-    for br in el.find_all("br"):
-        br.replace_with("\n")
-    for li in el.find_all("li"):
-        txt = li.get_text(" ", strip=True)
-        li.replace_with("\n• " + txt + "\n")
-    for tag in el.find_all(["p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "tr"]):
-        tag.insert_before("\n")
-        tag.insert_after("\n")
-    text = el.get_text("\n")
-    text = _fix_mojibake(text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n[ \t]+", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-# =============================================================================
-#  DATE / FIELD EXTRACTORS
-# =============================================================================
-
-def iso_dates(text: str) -> list:
-    """Return ISO dates parsed from YYYY-MM-DD, in order of appearance."""
-    out = []
-    for y, m, d in ISO_DATE_RE.findall(text or ""):
-        try:
-            out.append(datetime(int(y), int(m), int(d)).strftime("%Y-%m-%d"))
-        except ValueError:
-            pass
-    return out
-
-def mdy_dates(text: str) -> list:
-    """Return ISO dates parsed from 'Month DD, YYYY', in order."""
-    out = []
-    for mon, d, y in MDY_DATE_RE.findall(text or ""):
-        month = MONTHS.get(mon.lower())
-        if not month:
-            continue
-        try:
-            out.append(datetime(int(y), month, int(d)).strftime("%Y-%m-%d"))
-        except ValueError:
-            pass
-    return out
-
-def dmy_dates(text: str) -> list:
-    """Return ISO dates parsed from DD/MM/YYYY, in order."""
-    out = []
-    for d, m, y in DMY_DATE_RE.findall(text or ""):
-        try:
-            out.append(datetime(int(y), int(m), int(d)).strftime("%Y-%m-%d"))
-        except ValueError:
-            pass
-    return out
-
-def text_dates(text: str) -> list:
-    """Return ISO dates parsed from ordinal text form ('30th June 2026'), in order."""
-    out = []
-    for d, mon, y in TEXT_DATE_RE.findall(text or ""):
-        month = MONTHS.get(mon.lower())
-        if not month:
-            continue
-        try:
-            out.append(datetime(int(y), month, int(d)).strftime("%Y-%m-%d"))
-        except ValueError:
-            pass
-    return out
-
-def parse_any_date(text: str) -> str:
-    """Best single date from a label value (ISO, then numeric, then Month-name forms)."""
-    for fn in (iso_dates, dmy_dates, mdy_dates, text_dates):
-        ds = fn(text)
-        if ds:
-            return ds[-1]
-    return ""
-
-def clean_title(raw: str) -> str:
-    """Strip a trailing 'N views' / 'views' / Arabic 'مشاهدات' counter from a detail H1."""
-    t = sanitize_text(raw)
-    t = re.sub(r"\s*\d[\d,]*\s*(?:views?|مشاهد\w*)\s*$", "", t, flags=re.I)
-    t = re.sub(r"\s*(?:views?|مشاهد\w*)\s*$", "", t, flags=re.I)
-    return t.strip()
-
-def map_job_type(raw: str) -> str:
-    """Substring-aware so 'Full Time - دوام كامل' and Arabic-only forms both resolve."""
-    key = (raw or "").lower().strip()
-    if not key:
-        return "full-time"
-    if key in JOB_TYPE_MAPPING:
-        return JOB_TYPE_MAPPING[key]
-    for k, v in JOB_TYPE_MAPPING.items():
-        if k in key:
-            return v
-    return "full-time"
-
-def pick_location(locations: list) -> str:
-    """Prefer a recognised Libyan city over the 'Libya' country-level catch-all."""
-    cleaned = [_clean_bilingual(l) for l in locations]
-    cleaned = [c for c in cleaned if c]
-    # 1) a token that matches (or contains) a known Libyan/Tunis city wins.
-    for c in cleaned:
-        for town in LIBYA_LOCATIONS:
-            if re.search(rf"\b{re.escape(town)}\b", c, re.I):
-                return town
-    # 2) any specific (non-country) token.
-    specific = [c for c in cleaned if c.strip().lower() not in ("libya", "ليبيا")]
-    if specific:
-        return specific[0].strip()
-    if cleaned:
-        return cleaned[0].strip()
-    return DEFAULT_LOCATION
-
-def location_from_text(text: str) -> str:
-    if text:
-        for town in LIBYA_LOCATIONS:
-            if re.search(rf"\b{re.escape(town)}\b", text, re.I):
-                return town
-    return DEFAULT_LOCATION
-
-def extract_experience(qual_text: str) -> str:
-    if not qual_text:
-        return ""
-    m = re.search(r"(?:at least|minimum(?: of)?)\s+\d+\s+years?[^.\n;]*", qual_text, re.I)
-    if m:
-        return m.group(0).strip().rstrip(".")
-    m = re.search(r"\b\d+\s+years?[^.\n;]*experience", qual_text, re.I)
-    if m:
-        return m.group(0).strip().rstrip(".")
-    return ""
-
-def extract_salary(text: str) -> str:
-    """Best-effort salary in Libyan Dinar. Most NGO posts list none -> ''."""
     if not text:
-        return ""
-    m = re.search(r"(?:LYD|LD|د\.?\s?ل|دينار)\s*([0-9]{1,3}(?:,\s?[0-9]{3})+(?:\.[0-9]+)?)",
-                  text, re.I)
-    if m:
-        amt = re.sub(r"\s+", "", m.group(1))
-        return f"LYD {amt}"
-    m = re.search(r"\b(?:salary|remuneration|gross\s+pay)\b[^.\n]{0,80}", text, re.I)
-    if m and re.search(r"\d", m.group(0)):
-        return m.group(0).strip().rstrip(".")
-    return ""
+        return "en"
+    arabic_chars = len(_ARABIC_CHAR_RE.findall(text))
+    latin_chars  = len(_LATIN_CHAR_RE.findall(text))
+    total = arabic_chars + latin_chars
+    if total == 0:
+        return "en"
+    if arabic_chars / total >= 0.4:
+        return "ar"
+    return "en"
 
 # =============================================================================
-#  CANONICAL NORMALISERS  (shared schema — qualification tier / experience band /
-#  job field). These mirror the mappings used across the other country pipelines
-#  so LibyanJobs rows land in the same shape: a TIER label for qualification, a
-#  BAND label for experience, and a single canonical FIELD rather than the site's
-#  raw multi-category tag dump. The keyword maps are English; they fire on the
-#  (overwhelmingly English) NGO / corporate bodies. Arabic-only local listings
-#  fall back to the site's own category.
-# =============================================================================
-
-def _kw_hit(text_low: str, keywords) -> bool:
-    for k in keywords:
-        kk = k.strip().lower()
-        if not kk:
-            continue
-        esc = re.escape(kk)
-        if len(kk) <= 3:
-            pat = r"(?<![a-z0-9])" + esc + r"(?![a-z0-9])"
-        else:
-            pat = r"(?<![a-z0-9])" + esc + r"(?:es|s)?(?![a-z0-9])"
-        if re.search(pat, text_low):
-            return True
-    return False
-
-# --- Qualification: text -> single tier label -------------------------------
-QUALIFICATION_TIERS = [
-    ("PhD / Doctorate",          ["phd", "ph.d", "doctorate", "doctoral", "doctor of philosophy"]),
-    ("Master's Degree",          ["master", "msc", "m.sc", "ma ", "m.a ", "mba", "m.b.a", "meng",
-                                  "m.eng", "mphil", "postgraduate", "post-graduate", "post graduate"]),
-    ("Bachelor's Degree",        ["bachelor", "bsc", "b.sc", "ba ", "b.a ", "beng", "b.eng", "bcom",
-                                  "b.com", "bba", "llb", "degree in", "undergraduate degree",
-                                  "university degree", "honours degree", "hons"]),
-    ("Higher National Diploma",  ["hnd", "hnc", "higher national diploma", "higher national certificate",
-                                  "higher diploma", "advanced diploma"]),
-    ("Diploma",                  ["diploma", "dip ", "dip.", "associate degree", "foundation degree"]),
-    ("Professional Certification", ["acca", "cpa", "cfa", "cima", "pmp", "prince2", "cissp",
-                                    "aws certified", "comptia", "cisco", "ccna", "ccnp", "shrm",
-                                    "cipd", "chartered", "certified public", "certified financial",
-                                    "certified project", "professional certification",
-                                    "professional certificate"]),
-    ("A-Levels / HSC",           ["a-level", "a level", "hsc", "higher school certificate", "ib diploma",
-                                  "international baccalaureate", "gce advanced"]),
-    ("O-Levels / School Certificate", ["o-level", "o level", "igcse", "gcse", "school certificate",
-                                       "secondary school", "high school diploma"]),
-    ("Vocational / Technical",   ["vocational", "technical school", "vocational school", "trade certificate",
-                                  "institute diploma"]),
-    ("No Formal Qualification Required", ["no qualification", "no degree", "no formal", "school leaver",
-                                          "entry level", "no experience required", "training provided",
-                                          "will train"]),
-]
-
-def extract_qualification(text: str) -> str:
-    if not text:
-        return ""
-    if re.search(r"nursery|primary years|ib pyp|aged between|boys and girls", text, re.I):
-        return ""
-    lower = text.lower()
-    for label, keywords in QUALIFICATION_TIERS:
-        if _kw_hit(lower, keywords):
-            return label
-    return ""
-
-# --- Experience: text -> single band label ----------------------------------
-NO_EXP_KW = ["no experience", "no prior experience", "fresh graduate", "freshers",
-             "entry level", "entry-level", "0 years", "zero experience",
-             "training provided", "will train", "no experience required"]
-LESS1_KW  = ["less than 1 year", "under 1 year", "6 months", "less than a year",
-             "some experience", "minimal experience"]
-
-def years_to_band(n: int) -> str:
-    if n <= 0:  return "No Experience Required"
-    if n <= 2:  return "1 - 2 Years"
-    if n <= 5:  return "3 - 5 Years"
-    if n <= 10: return "6 - 10 Years"
-    return "10+ Years"
-
-_EXP_CAP = 20
-_EXP_REQ_RE = re.compile(
-    r"(?:minimum|min\.?|at\s+least|atleast|least|over|more\s+than|not\s+less\s+than|"
-    r"minimum\s+of|a\s+minimum\s+of)\s+(?:of\s+)?(\d{1,2})\s*\+?\s*years?", re.I)
-_EXP_YEARS_OF_RE = re.compile(r"(\d{1,2})\s*\+?\s*years?\s*['’]?\s+of\b", re.I)
-_EXP_ANY_YEARS_RE = re.compile(r"(\d{1,2})\s*\+?\s*years?", re.I)
-_EXP_RANGE_RE = re.compile(r"(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\s*years?", re.I)
-
-def extract_experience_band(text: str) -> str:
-    """Map free text to one of the canonical experience bands (or '')."""
-    if not text:
-        return ""
-    low = text.lower()
-    years = []
-    for m in _EXP_REQ_RE.finditer(text):
-        n = int(m.group(1))
-        if 0 < n <= _EXP_CAP:
-            years.append(n)
-    for m in _EXP_YEARS_OF_RE.finditer(low):
-        n = int(m.group(1))
-        if 0 < n <= _EXP_CAP:
-            years.append(n)
-    for m in _EXP_ANY_YEARS_RE.finditer(low):
-        n = int(m.group(1))
-        if 0 < n <= _EXP_CAP and "experien" in low[m.end():m.end() + 60]:
-            years.append(n)
-    for m in _EXP_RANGE_RE.finditer(text):
-        a = int(m.group(1))
-        if 0 < a <= _EXP_CAP:
-            years.append(a)
-    if years:
-        return years_to_band(min(years))
-    if _kw_hit(low, NO_EXP_KW):
-        return "No Experience Required"
-    if _kw_hit(low, LESS1_KW):
-        return "1 - 2 Years"
-    return ""
-
-# --- Job field: title+description -> single canonical field -----------------
-FIELD_KEYWORD_MAP = [
-    ("Information Technology",
-     ["software engineer", "developer", "devops", "frontend", "backend", "full stack", "fullstack",
-      "sysadmin", "cloud", "cybersecurity", "data engineer", "machine learning", "artificial intelligence",
-      "ai/ml", "it support", "network engineer", "noc engineer", "database", "kubernetes", "docker",
-      "aws", "azure", "react", "node.js", "python developer", "java developer", "ict officer"],
-     ["programming", "coding", "api", "agile", "scrum", "git", "linux", "server", "infrastructure", "software"]),
-    ("Finance & Accounting",
-     ["accountant", "auditor", "finance manager", "financial analyst", "cfo", "treasurer", "tax",
-      "bookkeeper", "payroll", "budget analyst", "credit analyst", "investment", "portfolio manager",
-      "risk analyst", "forex", "actuary", "acca", "cfa", "cpa", "finance officer", "cashier", "cash assistant"],
-     ["financial", "accounting", "balance sheet", "p&l", "reconciliation", "ifrs", "gaap", "ledger", "invoicing"]),
-    ("Sales & Business Development",
-     ["sales executive", "sales manager", "business development", "account manager",
-      "sales representative", "bd manager", "regional sales", "key account", "sales director",
-      "commercial manager", "sales officer"],
-     ["revenue", "pipeline", "crm", "leads", "prospects", "quota", "target", "upsell", "cross-sell", "b2b", "b2c"]),
-    ("Marketing & Communications",
-     ["marketing manager", "digital marketing", "seo", "sem", "content marketer", "social media manager",
-      "social media marketing", "brand manager", "marketing executive", "communications manager",
-      "communications officer", "pr manager", "copywriter", "growth hacker", "email marketing", "campaign manager"],
-     ["marketing", "branding", "advertising", "social media", "content", "campaign", "analytics",
-      "google ads", "facebook ads", "influencer"]),
-    ("Human Resources",
-     ["hr manager", "human resources", "recruiter", "talent acquisition", "hr business partner",
-      "hrbp", "hr officer", "compensation", "benefits manager", "organisational development",
-      "learning and development", "l&d", "hr generalist", "payroll manager"],
-     ["recruitment", "onboarding", "performance management", "employee relations", "hr", "workforce"]),
-    ("Engineering",
-     ["mechanical engineer", "civil engineer", "electrical engineer", "structural engineer",
-      "process engineer", "project engineer", "maintenance engineer", "production engineer",
-      "quality engineer", "safety engineer", "site engineer", "design engineer",
-      "telecommunication engineer"],
-     ["engineering", "cad", "autocad", "solidworks", "manufacturing", "plant", "machinery", "commissioning"]),
-    ("Oil, Gas & Energy",
-     ["oil and gas", "rig", "offshore", "onshore", "wellhead", "refinery", "pipeline engineer",
-      "petroleum engineer", "drilling engineer", "reservoir", "hse oil", "drilling supervisor",
-      "production operator", "field operator", "upstream"],
-     ["petroleum", "hydrocarbon", "oilfield", "gas field", "energy sector"]),
-    ("Healthcare & Medicine",
-     ["doctor", "physician", "nurse", "pharmacist", "medical officer", "surgeon", "anaesthetist",
-      "physiotherapist", "radiographer", "lab technician", "clinical", "healthcare manager",
-      "occupational therapist", "dentist", "midwife", "health officer", "medical doctor"],
-     ["hospital", "clinic", "patient", "medical", "health", "pharmaceutical", "diagnosis", "treatment"]),
-    ("Education & Training",
-     ["teacher", "lecturer", "professor", "trainer", "educator", "tutor", "school principal",
-      "academic", "curriculum", "e-learning", "instructional designer", "teaching assistant"],
-     ["school", "university", "college", "classroom", "students", "pedagogy", "curriculum", "education"]),
-    ("Hospitality & Tourism",
-     ["hotel manager", "front desk", "housekeeping", "chef", "sous chef", "food and beverage",
-      "f&b manager", "restaurant manager", "bartender", "waiter", "concierge", "tour guide",
-      "travel agent", "events coordinator", "catering", "welcome supervisor"],
-     ["hospitality", "hotel", "resort", "tourism", "guest", "accommodation", "restaurant", "kitchen"]),
-    ("Logistics & Supply Chain",
-     ["supply chain manager", "logistics coordinator", "logistics officer", "warehouse manager",
-      "fleet manager", "procurement manager", "procurement officer", "purchasing manager",
-      "import export", "freight", "shipping coordinator", "inventory manager", "demand planner", "driver"],
-     ["logistics", "supply chain", "warehouse", "inventory", "freight", "procurement", "sourcing"]),
-    ("Legal",
-     ["lawyer", "attorney", "legal counsel", "paralegal", "compliance officer", "legal advisor",
-      "solicitor", "barrister", "corporate counsel", "legal manager", "contract manager"],
-     ["legal", "law", "contracts", "litigation", "regulatory", "compliance", "gdpr"]),
-    ("Administration & Operations",
-     ["office manager", "executive assistant", "administrative officer", "operations manager",
-      "admin officer", "personal assistant", "receptionist", "data entry", "office administrator",
-      "company secretary", "business analyst", "operations officer", "admin assistant"],
-     ["administration", "operations", "office", "coordination", "scheduling", "reporting", "clerical"]),
-    ("Customer Service",
-     ["customer service", "call centre", "customer success", "customer support", "help desk",
-      "service advisor", "client relations", "customer experience", "contact centre"],
-     ["customer", "support", "helpdesk", "tickets", "escalation", "satisfaction", "service level"]),
-    ("Construction & Real Estate",
-     ["quantity surveyor", "site supervisor", "project manager construction", "architect",
-      "draughtsman", "property manager", "estate agent", "real estate", "building inspector",
-      "land surveyor", "construction manager", "foreman"],
-     ["construction", "building", "property", "real estate", "site", "contractor", "tender"]),
-    ("Manufacturing & Production",
-     ["production manager", "quality control", "quality assurance", "qa", "qc", "factory manager",
-      "plant manager", "production supervisor", "assembly", "cnc operator", "technician"],
-     ["production", "manufacturing", "factory", "assembly", "quality", "lean", "six sigma"]),
-    ("Design & Creative",
-     ["graphic designer", "ui/ux", "product designer", "art director", "creative director",
-      "animator", "illustrator", "photographer", "videographer", "motion designer", "web designer"],
-     ["design", "creative", "adobe", "figma", "photoshop", "illustrator", "indesign", "sketch", "branding"]),
-    ("Research & Science",
-     ["research scientist", "data scientist", "lab researcher", "research analyst",
-      "clinical researcher", "environmental scientist", "chemist", "biologist", "statistician"],
-     ["research", "analysis", "data", "laboratory", "science", "experiment", "findings", "methodology"]),
-    ("Security & Safety",
-     ["security officer", "security guard", "security manager", "cctv", "loss prevention",
-      "risk manager", "health and safety", "hse officer", "osh", "fire safety", "demining",
-      "eod", "mine action", "survey operator"],
-     ["security", "safety", "risk", "surveillance", "patrol", "access control", "emergency", "uxo", "erw"]),
-    ("Media & Journalism",
-     ["journalist", "editor", "reporter", "broadcast", "news anchor", "content creator",
-      "media manager", "radio", "television", "producer", "scriptwriter"],
-     ["media", "journalism", "broadcast", "news", "editorial", "publishing", "press"]),
-    ("Non-Profit & Humanitarian",
-     ["social worker", "ngo", "charity", "programme coordinator", "program coordinator",
-      "community development", "welfare officer", "case manager", "development officer", "fundraiser",
-      "volunteer coordinator", "protection officer", "field officer", "project officer",
-      "humanitarian", "wash officer", "monitoring and evaluation", "m&e officer", "mhpss"],
-     ["social", "ngo", "community", "welfare", "beneficiary", "donor", "impact", "charity",
-      "humanitarian", "refugee", "idp", "unhcr", "unicef", "relief"]),
-]
-
-# Procurement / notice markers in a title (conservative).
-_TENDER_TITLE_RE = re.compile(
-    r"\b(?:rfq|rfp|reoi|eoi|itb|itt|spn|rfb|rfa|gpn|ifb|rfi)\b"
-    r"|invitation\s+to\s+(?:bid|tender)|invitation\s+for\s+bids?"
-    r"|request\s+for\s+(?:quotation|proposal|proposals|expression|expressions|bids?)"
-    r"|expressions?\s+of\s+interest"
-    r"|\btenders?\b|procurement\s+notice|specific\s+procurement|general\s+procurement"
-    r"|call\s+for\s+(?:bid|bids|tender|tenders|proposal|proposals|expression|expressions|quotation)"
-    r"|matching\s+grant|terms\s+of\s+reference|prior\s+notice\s+of\s+procurement",
-    re.I,
-)
-TENDER_FIELD = "Public Notices & Tenders"
-
-def infer_field(title: str, description: str, fallback_categories: str = "") -> str:
-    """
-    Resolve a single canonical job field from the title + description. Procurement
-    notices are detected first and routed to "Public Notices & Tenders" — otherwise
-    incidental keyword hits mislabel them. After that, strong keywords win over weak
-    (list order = tie-break). If nothing matches, fall back to the site's own
-    (Latin-cleaned) category so the field is never empty.
-    """
-    title_l = (title or "").lower()
-    if _TENDER_TITLE_RE.search(title_l):
-        return TENDER_FIELD
-
-    text = f"{title}\n{description}".lower()
-    for field, strong, _weak in FIELD_KEYWORD_MAP:
-        if _kw_hit(text, strong):
-            return field
-    for field, _strong, weak in FIELD_KEYWORD_MAP:
-        if _kw_hit(text, weak):
-            return field
-    if fallback_categories:
-        cats = [_clean_bilingual(c) for c in fallback_categories.split(",")]
-        cats = [c for c in cats if c]
-        for c in cats:
-            if "tender" in c.lower() or "notice" in c.lower():
-                return TENDER_FIELD
-        if cats:
-            return cats[0]
-    return ""
-
-# =============================================================================
-#  NLP TOOLS (lazy init, optional)
+#  NLP TOOLS (lazy init)
 # =============================================================================
 
 _grammar_tool = None
@@ -888,7 +335,7 @@ def _get_grammar_tool():
             _grammar_tool = language_tool_python.LanguageTool(
                 "en-US", remote_server="https://api.languagetool.org")
         except Exception as e:
-            log_.warning(f"LanguageTool init failed: {e}")
+            log.warning(f"LanguageTool init failed: {e}")
     return _grammar_tool
 
 def _get_sim_model():
@@ -897,7 +344,7 @@ def _get_sim_model():
         try:
             _sim_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
         except Exception as e:
-            log_.warning(f"SentenceTransformer init failed: {e}")
+            log.warning(f"SentenceTransformer init failed: {e}")
     return _sim_model
 
 def grammar_correct(text: str) -> str:
@@ -920,8 +367,7 @@ def similarity_score(a: str, b: str) -> float:
     def tokens(s):
         return set(re.sub(r"[^a-z0-9 ]", " ", s.lower()).split())
     ta, tb = tokens(a), tokens(b)
-    if not ta or not tb:
-        return 0.0
+    if not ta or not tb: return 0.0
     return len(ta & tb) / max(len(ta), len(tb))
 
 def clean_output(text: str) -> str:
@@ -940,7 +386,7 @@ def clean_output(text: str) -> str:
 
 def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
     if not MISTRAL_API_KEY:
-        log_.warning("MISTRAL_API_KEY not set — skipping paraphrase")
+        log.warning("MISTRAL_API_KEY not set — skipping paraphrase")
         return ""
     try:
         response = requests.post(
@@ -960,7 +406,7 @@ def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        log_.error(f"Mistral API error: {e}")
+        log.error(f"Mistral API error: {e}")
         return ""
 
 # =============================================================================
@@ -978,13 +424,6 @@ def _print_wrapped(text: str, prefix: str = "   ", width: int = 100):
     if line:
         print(f"{prefix}{' '.join(line)}")
 
-def _is_mostly_arabic(text: str) -> bool:
-    """True if the text is predominantly Arabic script (skip EN paraphrase then)."""
-    if not text:
-        return False
-    ar = len(_ARABIC_RE.findall(text))
-    latin = len(re.findall(r"[A-Za-z]", text))
-    return ar > latin
 
 def paraphrase_title(title: str) -> str:
     if not ENABLE_PARAPHRASE:
@@ -992,9 +431,6 @@ def paraphrase_title(title: str) -> str:
     clean = sanitize_text(title)
     if not clean:
         return title
-    if _is_mostly_arabic(clean):
-        # Don't English-paraphrase an Arabic title — keep it verbatim.
-        return clean
 
     print(f"\n ┌─ TITLE PARAPHRASE {'─'*45}")
     print(f" │ Original : \"{clean}\"")
@@ -1021,7 +457,7 @@ def paraphrase_title(title: str) -> str:
         is_dup = result.lower().strip() == clean.lower().strip()
 
         print(f" │    Output  : \"{result}\"")
-        print(f" │    Words   : {wc} | Similarity: {sim:.3f} | Duplicate: {'Yes' if is_dup else 'No'}")
+        print(f" │    Words   : {wc} | Similarity: {sim:.3f} | Duplicate: {'Yes ⚠️' if is_dup else 'No'}")
 
         valid = bool(result) and 4 <= wc <= 14 and sim >= 0.55 and not is_dup
 
@@ -1032,27 +468,28 @@ def paraphrase_title(title: str) -> str:
             if wc > 14:     reasons.append(f"too long ({wc} words, max=14)")
             if sim < 0.55:  reasons.append(f"sim={sim:.3f} < 0.55")
             if is_dup:      reasons.append("identical to original")
-            print(f" │    -> REJECTED — {', '.join(reasons)}")
+            print(f" │    → ❌ REJECTED — {', '.join(reasons)}")
         else:
             if sim > best_sim:
                 best_sim    = sim
                 best_result = result
-                print(f" │    -> ACCEPTED — new best candidate (sim={sim:.3f})")
+                print(f" │    → ✅ ACCEPTED — new best candidate (sim={sim:.3f})")
             else:
-                print(f" │    -> VALID but not better than current best (best sim={best_sim:.3f})")
+                print(f" │    → ✅ VALID but not better than current best (best sim={best_sim:.3f})")
 
         print(f" │ {'─'*60}")
         time.sleep(1)
 
     if best_result:
-        print(f" │ FINAL SELECTED : \"{best_result}\"")
-        print(f" │    Similarity  : {best_sim:.3f}")
+        print(f" │ 🏆 FINAL SELECTED : \"{best_result}\"")
+        print(f" │    Similarity     : {best_sim:.3f}")
         print(f" └{'─'*65}")
         return best_result
     else:
-        print(f" │ No valid paraphrase found -> Keeping original: \"{clean}\"")
+        print(f" │ ⚠️  No valid paraphrase found → Keeping original: \"{clean}\"")
         print(f" └{'─'*65}")
         return clean
+
 
 def paraphrase_description(text: str) -> str:
     if not ENABLE_PARAPHRASE:
@@ -1061,13 +498,11 @@ def paraphrase_description(text: str) -> str:
     if not clean:
         return text
 
-    paragraphs  = [p.strip() for p in re.split(r"\n+", clean) if p.strip()]
-    if not paragraphs:
-        paragraphs = [clean]
+    paragraphs  = [p.strip() for p in clean.split("\n") if p.strip()]
     rewritten   = []
     success_count = 0
 
-    print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraph(s)) {'─'*15}")
+    print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraphs) {'─'*25}")
 
     for i, para in enumerate(paragraphs):
         orig_wc = len(para.split())
@@ -1076,14 +511,6 @@ def paraphrase_description(text: str) -> str:
         print(f" │ │ ORIGINAL ({orig_wc} words):")
         _print_wrapped(para, prefix=" │ │    ")
         print(f" │ │ {'─'*60}")
-
-        # Very short fragments, or Arabic paragraphs — keep as-is.
-        if orig_wc < 8 or _is_mostly_arabic(para):
-            why = "Arabic — kept verbatim" if _is_mostly_arabic(para) else "too short to paraphrase safely"
-            print(f" │ │ (kept — {why})")
-            rewritten.append(para)
-            print(f" │ └{'─'*62}")
-            continue
 
         prompt = (
             f"Rewrite this job description paragraph professionally. "
@@ -1120,13 +547,13 @@ def paraphrase_description(text: str) -> str:
                 if not result: reasons.append("empty output")
                 if rw < 8:     reasons.append(f"too short ({rw} words, min=8)")
                 if sim < 0.48: reasons.append(f"sim={sim:.3f} < 0.48")
-                print(f" │ │    -> REJECTED — {', '.join(reasons)}")
+                print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
                 if result and sim > best_sim:
                     best_sim    = sim
                     best_result = result
                     print(f" │ │       (stored as best fallback, sim={sim:.3f})")
             else:
-                print(f" │ │    -> ACCEPTED on attempt {attempt+1}")
+                print(f" │ │    → ✅ ACCEPTED on attempt {attempt+1}")
                 rewritten.append(result)
                 success_count += 1
                 accepted_text = result
@@ -1138,12 +565,12 @@ def paraphrase_description(text: str) -> str:
         if accepted_text is None:
             print(f" │ │ {'─'*60}")
             if best_result and best_sim >= 0.40:
-                print(f" │ │ FALLBACK — Using best attempt (sim={best_sim:.3f}):")
+                print(f" │ │ 🔁 FALLBACK — Using best attempt (sim={best_sim:.3f}):")
                 _print_wrapped(best_result, prefix=" │ │    ")
                 rewritten.append(best_result)
                 success_count += 1
             else:
-                print(f" │ │ KEPT ORIGINAL — no acceptable paraphrase (best sim={best_sim:.3f})")
+                print(f" │ │ ⚠️  KEPT ORIGINAL — no acceptable paraphrase (best sim={best_sim:.3f})")
                 rewritten.append(para)
 
         print(f" │ └{'─'*62}")
@@ -1153,121 +580,2212 @@ def paraphrase_description(text: str) -> str:
 
     return "\n\n".join(rewritten)
 
+
+def paraphrase_company(text: str) -> str:
+    if not ENABLE_PARAPHRASE:
+        return text
+    clean = sanitize_text(text)
+    if not clean:
+        return text
+
+    print(f"\n ┌─ COMPANY PARAPHRASE {'─'*43}")
+    orig_wc = len(clean.split())
+    print(f" │ Original ({orig_wc} words):")
+    _print_wrapped(clean, prefix=" │    ")
+    print(f" │ {'─'*60}")
+
+    prompt = (
+        f"Rewrite this company description professionally. "
+        f"Preserve all facts. Use different wording. "
+        f"Output ONLY the rewritten description.\n\nOriginal:\n{clean}"
+    )
+
+    raw    = mistral_generate(prompt, max_tokens=600, temperature=0.68)
+    result = clean_output(raw)
+    rw     = len(result.split()) if result else 0
+    sim    = similarity_score(clean, result) if result and rw >= 10 else 0.0
+
+    if result and rw >= 10:
+        print(f" │ Paraphrased ({rw} words, sim={sim:.3f}):")
+        _print_wrapped(result, prefix=" │    ")
+        print(f" │ → ✅ ACCEPTED")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return result
+    else:
+        reasons = []
+        if not result: reasons.append("empty output")
+        if rw < 10:    reasons.append(f"too short ({rw} words, min=10)")
+        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return clean
+
+
+def paraphrase_tagline(text: str) -> str:
+    if not ENABLE_PARAPHRASE:
+        return text
+    clean = sanitize_text(text[:300])
+    if not clean:
+        return text
+
+    print(f"\n ┌─ TAGLINE PARAPHRASE {'─'*43}")
+    print(f" │ Original : \"{clean}\"")
+    print(f" │ {'─'*60}")
+
+    prompt = (
+        f"Rewrite this company tagline as a crisp, professional phrase. "
+        f"Output ONLY the rewritten tagline (5–12 words). No explanation.\n\n"
+        f"Original: {clean}"
+    )
+
+    raw    = mistral_generate(prompt, max_tokens=35, temperature=0.75)
+    result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
+    wc     = len(result.split()) if result else 0
+
+    print(f" │ Paraphrased : \"{result}\"")
+    print(f" │ Words: {wc}")
+
+    if result and 3 <= wc <= 15:
+        print(f" │ → ✅ ACCEPTED")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return result
+    else:
+        reasons = []
+        if not result: reasons.append("empty output")
+        if wc < 3:     reasons.append(f"too short ({wc} words, min=3)")
+        if wc > 15:    reasons.append(f"too long ({wc} words, max=15)")
+        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
+        print(f" └{'─'*65}")
+        time.sleep(1)
+        return clean
+
 # =============================================================================
-#  DUPLICATE TRACKER — pure stdlib csv, NO pandas dependency
+#  DUPLICATE TRACKER
 # =============================================================================
 
 def _init_tracker():
     if not os.path.exists(PROCESSED_IDS_FILE):
-        try:
-            with open(PROCESSED_IDS_FILE, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(_TRACKER_FIELDS)
-            log_.info(f"Tracker file created: {PROCESSED_IDS_FILE}")
-        except Exception as e:
-            log_.error(f"Could not create tracker file {PROCESSED_IDS_FILE}: {e}")
+        pd.DataFrame(columns=[
+            "Job ID", "Job URL", "Job Title", "Company Name",
+            "Status", "Timestamp", "WP ID",
+        ]).to_csv(PROCESSED_IDS_FILE, index=False)
 
 def load_processed_ids() -> tuple:
     _init_tracker()
-    ids, urls = set(), set()
-    try:
-        with open(PROCESSED_IDS_FILE, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                if row.get("Job ID"):
-                    ids.add(row["Job ID"].strip())
-                if row.get("Job URL"):
-                    urls.add(row["Job URL"].strip())
-    except Exception as e:
-        log_.error(f"Could not read tracker file: {e}")
-    return ids, urls
+    df = pd.read_csv(PROCESSED_IDS_FILE)
+    return (
+        set(df["Job ID"].fillna("").astype(str)),
+        set(df.get("Job URL", pd.Series()).fillna("").astype(str)),
+    )
 
 def _upsert_row(job_id: str, updates: dict):
     _init_tracker()
-    rows = []
-    try:
-        with open(PROCESSED_IDS_FILE, newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-    except Exception as e:
-        log_.error(f"Tracker read error: {e}")
-        rows = []
+    df   = pd.read_csv(PROCESSED_IDS_FILE)
+    mask = df["Job ID"].astype(str) == str(job_id)
+    if mask.any():
+        for col, val in updates.items():
+            if col in df.columns:
+                df.loc[mask, col] = val
+        df.loc[mask, "Timestamp"] = datetime.now().isoformat()
+    else:
+        row = {"Job ID": job_id, "Timestamp": datetime.now().isoformat()}
+        row.update(updates)
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(PROCESSED_IDS_FILE, index=False)
 
-    found = False
-    for row in rows:
-        if row.get("Job ID", "").strip() == str(job_id):
-            row.update(updates)
-            row["Timestamp"] = datetime.now().isoformat()
-            found = True
-            break
-
-    if not found:
-        new_row = {k: "" for k in _TRACKER_FIELDS}
-        new_row["Job ID"]    = str(job_id)
-        new_row["Timestamp"] = datetime.now().isoformat()
-        new_row.update(updates)
-        rows.append(new_row)
-
-    try:
-        with open(PROCESSED_IDS_FILE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=_TRACKER_FIELDS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-    except Exception as e:
-        log_.error(f"Tracker write error: {e}")
-
-def make_job_id(job_url: str, title: str = "", company: str = "") -> str:
+def make_job_id(job_url: str, title: str = "", company: str = "", idx: int = 0) -> str:
     if job_url:
         return hashlib.md5(job_url.encode()).hexdigest()[:16]
-    seed = f"{title}{company}"
+    seed = f"{title}{company}{idx}"
     return hashlib.md5(seed.encode()).hexdigest()[:16]
 
 def mark_scraped(job_id, job_url, title, company):
-    log_.info(f"Tracker -> scraped: {job_id} | {title}")
-    _upsert_row(job_id, {
-        "Job URL":      job_url,
-        "Job Title":    title,
-        "Company Name": company,
-        "Status":       "scraped",
-        "WP ID":        "",
-    })
+    _upsert_row(job_id, {"Job URL": job_url, "Job Title": title,
+                          "Company Name": company, "Status": "scraped"})
 
 def mark_paraphrased(job_id):
     _upsert_row(job_id, {"Status": "paraphrased"})
 
 def mark_posted(job_id, wp_id, wp_url):
-    _upsert_row(job_id, {"Status": "posted", "WP ID": str(wp_id)})
+    _upsert_row(job_id, {"Status": "posted", "WP ID": wp_id})
 
 def mark_failed(job_id, reason):
     _upsert_row(job_id, {"Status": f"failed|{reason}"})
 
 # =============================================================================
-#  FLAGGED CSV (non-qualifying / login-only apply)
+#  HELPERS
 # =============================================================================
 
-def _init_flagged():
-    if not os.path.exists(FLAGGED_FILE):
-        try:
-            with open(FLAGGED_FILE, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(_FLAGGED_FIELDS)
-        except Exception as e:
-            log_.error(f"Could not create flagged file {FLAGGED_FILE}: {e}")
+def should_skip_crawl(url: str) -> bool:
+    if not url: return True
+    return any(d in url.lower() for d in SKIP_CRAWL_DOMAINS)
 
-def write_flagged(raw_job: dict, reason: str, apply_note: str):
-    _init_flagged()
+def is_bad_url(url: str) -> bool:
+    if not url or not url.startswith("http"): return True
+    return any(d in url.lower() for d in BAD_DOMAINS)
+
+def is_ats_url(url: str) -> bool:
+    if not url: return False
+    return any(d in url.lower() for d in ATS_DOMAINS)
+
+def is_career_url(url: str) -> bool:
+    l = url.lower()
+    return any(k in l for k in [
+        "career","jobs","apply","vacanci","recruit","opening",
+        "hiring","work-with","join-us","join_us","opportunities",
+        "current-opening","job-listing","positions",
+    ])
+
+def is_contact_url(url: str) -> bool:
+    l = url.lower()
+    return any(k in l for k in [
+        "contact","about","reach","get-in","enquir","support",
+        "about-us","about_us",
+    ])
+
+def is_about_url(url: str) -> bool:
+    l = url.lower()
+    return any(k in l for k in [
+        "about","who-we-are","our-story","company","our-team",
+        "overview","mission","vision",
+    ])
+
+def make_absolute(href: str, root_url: str) -> str:
+    if not href: return ""
+    href = href.strip()
+    if href.startswith("http"): return href
+    if href.startswith("//"): return "https:" + href
+    if href.startswith("/"): return root_url.rstrip("/") + href
+    return ""
+
+def decode_html_entities(s: str) -> str:
+    if not s: return ""
+    for old, new in [("&amp;","&"),("&lt;","<"),("&gt;",">"),("&quot;",'"'),
+                     ("&#39;","'"),("\\u0026","&"),("\\u003D","="),
+                     ("\\u003A",":"),("\\u002F","/")]:
+        s = s.replace(old, new)
+    return s
+
+def canonicalise_job_url(url: str) -> str:
+    if not url: return ""
+    m = re.search(r"/jobs/view/(\d+)", url)
+    if m: return f"https://www.linkedin.com/jobs/view/{m.group(1)}/"
+    return re.sub(r"[?#].*$", "", url)
+
+def _strip_li_tracking(url: str) -> str:
+    if not url: return ""
+    url = decode_html_entities(url)
+    m = re.search(r"[?&]url=([^&]+)", url)
+    if m:
+        try:
+            decoded = unquote(m.group(1))
+            if "%" in decoded: decoded = unquote(decoded)
+            if decoded.startswith("http") and "linkedin.com" not in decoded:
+                return decoded
+        except Exception:
+            pass
+    return url
+
+def _title_similarity(a: str, b: str) -> float:
+    if not a or not b: return 0.0
+    def tokens(s):
+        return set(re.sub(r"[^a-z0-9 ]", " ", s.lower()).split())
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb: return 0.0
+    return len(ta & tb) / max(len(ta), len(tb))
+
+def _follow_redirect_chain(url: str, max_hops: int = 4) -> str:
+    """Follow up to max_hops HTTP redirects for ATS redirect chains."""
+    current = url
+    for _ in range(max_hops):
+        try:
+            r = requests.head(current, headers=_next_headers(),
+                              allow_redirects=False, timeout=8)
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = r.headers.get("Location", "")
+                if loc:
+                    if not loc.startswith("http"):
+                        parsed = urlparse(current)
+                        loc = f"{parsed.scheme}://{parsed.netloc}{loc}"
+                    current = loc
+                    continue
+        except Exception:
+            pass
+        break
+    return current
+
+# =============================================================================
+#  HTTP  (with retry + back-off)
+# =============================================================================
+
+def fetch_page(url: str, follow_redirects: bool = True, retries: int = 3) -> str | None:
+    for attempt in range(retries):
+        try:
+            time.sleep(0.3 + attempt * 1.5)
+            r = requests.get(url, headers=_next_headers(),
+                             allow_redirects=follow_redirects, timeout=20)
+            if r.status_code == 429:
+                wait = 30 + attempt * 30
+                log.warning(f"Rate-limited (429) — sleeping {wait}s")
+                time.sleep(wait); continue
+            if r.status_code in (403, 999):
+                log.warning(f"Blocked ({r.status_code}): {url}"); return None
+            if r.status_code != 200:
+                log.warning(f"HTTP {r.status_code}: {url}"); return None
+            text = r.text
+            if len(text) > FETCH_CHAR_LIMIT: text = text[:FETCH_CHAR_LIMIT]
+            return text
+        except Exception as e:
+            log.warning(f"fetch attempt {attempt+1} failed ({url}): {e}")
+            time.sleep(2 + attempt * 2)
+    return None
+
+# =============================================================================
+#  DATE HELPERS
+# =============================================================================
+
+def normalise_date_text(text: str) -> str:
+    if not text: return ""
+    fr_map = {"heure":"hour","heures":"hours","jour":"day","jours":"days",
+              "semaine":"week","semaines":"weeks","mois":"month","an":"year","ans":"years"}
+    m = re.search(r"il\s+y\s+a\s+(\d+)\s+([a-zéè]+)", text, re.I)
+    if m:
+        unit = fr_map.get(m.group(2).lower())
+        if unit: return f"{m.group(1)} {unit} ago"
+    if re.match(r"^hier$", text.strip(), re.I): return "1 day ago"
+    if re.search(r"aujourd|today", text, re.I): return "0 days ago"
+    return text
+
+def resolve_posted_date(raw: str) -> str:
+    if not raw: return ""
+    text = normalise_date_text(raw)
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", text.strip()): return text.strip()
+    try: return datetime.fromisoformat(text).strftime("%Y-%m-%d")
+    except Exception: pass
+    base = datetime.now()
+    m = re.search(r"(\d+)\s*(hour|day|week|month|year)", text, re.I)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        if "hour"  in unit: base -= timedelta(hours=n)
+        elif "day" in unit: base -= timedelta(days=n)
+        elif "week"in unit: base -= timedelta(weeks=n)
+        elif "month"in unit:
+            mo = base.month - n; yr = base.year + mo // 12; mo = mo % 12 or 12
+            base = base.replace(year=yr, month=mo)
+        elif "year"in unit: base = base.replace(year=base.year - n)
+        return base.strftime("%Y-%m-%d")
+    if re.search(r"just\s*now|today", text, re.I): return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now().strftime("%Y-%m-%d")
+
+def try_parse_date(s: str) -> datetime | None:
+    if not s: return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%B %d, %Y", "%d %B %Y"):
+        try: return datetime.strptime(s.strip(), fmt)
+        except Exception: pass
+    try: return datetime.fromisoformat(s)
+    except Exception: pass
+    m = re.match(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", s)
+    if m:
+        mon = MONTH_MAP.get(m.group(2)[:3].lower())
+        if mon is not None: return datetime(int(m.group(3)), mon+1, int(m.group(1)))
+    return None
+
+def parse_deadline(soup: BeautifulSoup) -> str:
+    full_text = soup.get_text()
+    patterns = [
+        r"closes?\s+on\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"closes?\s+on\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+        r"apply\s+by\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"apply\s+by\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+        r"applications?\s+close[sd]?\s*(?:on)?\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"deadline[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"deadline[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+        r"closing\s+date[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"closing\s+date[:\s]+(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+    ]
+    now = datetime.now()
+    for p in patterns:
+        m = re.search(p, full_text, re.I)
+        if m:
+            d = try_parse_date(m.group(1))
+            if d and d > now: return d.strftime("%Y-%m-%d")
+    return ""
+
+def estimate_deadline_from_posted(posted_text: str) -> str:
+    if not posted_text: return ""
+    text = normalise_date_text(posted_text)
+    base = datetime.now()
+    m = re.search(r"(\d+)\s*(hour|day|week|month)", text, re.I)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        if "hour" in unit:  base -= timedelta(hours=n)
+        elif "day"in unit:  base -= timedelta(days=n)
+        elif "week"in unit: base -= timedelta(weeks=n)
+        elif "month"in unit:
+            mo = base.month - n; yr = base.year + mo // 12; mo = mo % 12 or 12
+            base = base.replace(year=yr, month=mo)
+    mo = base.month + 3; yr = base.year + (mo - 1) // 12; mo = (mo - 1) % 12 + 1
+    return base.replace(year=yr, month=mo).strftime("%Y-%m-%d")
+
+# =============================================================================
+#  TEXT CLEANERS
+# =============================================================================
+
+def clean_description(raw: str) -> str:
+    if not raw: return ""
+    text = raw.replace("\u00a0"," ").replace("\u200b","").replace("\r\n","\n").replace("\r","\n")
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"(\d)([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"([.,:;!?])([A-Za-z0-9])", r"\1 \2", text)
+    text = re.sub(r"\s*[•·▪◦]\s*", "\n• ", text)
+    text = re.sub(r"\n\s*[-–—]\s+", "\n• ", text)
+    paragraphs = re.split(r"\n{2,}", text)
+    cleaned = []
+    for para in paragraphs:
+        lines = [l.strip() for l in para.split("\n") if l.strip()]
+        out = []
+        for line in lines:
+            if (not re.search(r"[.!?:;,]$", line)
+                    and not re.match(r"^[A-Z\s]{3,30}$", line)
+                    and len(line) > 8
+                    and not re.match(r"^[•\-–]", line)
+                    and not re.match(r"^\w+:$", line)):
+                line += "."
+            out.append(line)
+        cleaned.append("\n".join(out))
+    return re.sub(r" {2,}", " ", "\n\n".join(p for p in cleaned if p.strip())).strip()
+
+# v7: known TLDs used to correctly truncate email domains, fixing cases like
+# "hr.ksa@mammoet.comtak" → "hr.ksa@mammoet.com"
+COMMON_EMAIL_TLDS = [
+    "com","net","org","gov","edu","info","biz","co",
+    "sa","ae","uk","us","in","eg","jo","qa","kw","bh","om","ye","iq","lb","sy",
+    "ma","tn","dz","ly","sd","mu","mr","pk","tr","de","fr","it","es","nl","ch",
+    "io","app","tech","online","store","site","me","name","mobi",
+]
+_TLD_RE_PART = "|".join(sorted(set(COMMON_EMAIL_TLDS), key=len, reverse=True))
+
+def clean_email(raw: str) -> str:
+    if not raw: return ""
+    em = raw
+    em = re.sub(r"^mailto:", "", em, flags=re.I)
+    em = re.sub(r"\?.*$", "", em)
+    for pat, rep in [(r"\\u003[Ee]",""),(r"\\u003[Cc]",""),(r"\\u0040","@"),
+                     (r"\\u002[Ee]","."),(r"\\u0026",""),(r"u003[Ee]",""),
+                     (r"u003[Cc]",""),(r"u0040","@"),(r"&amp;",""),(r"&lt;",""),
+                     (r"&gt;",""),(r"&#64;","@"),(r"&#46;","."),(r"&nbsp;",""),
+                     (r"%40","@"),(r"%2[Ee]","."),(r"%20",""),(r"[>]+$",""),
+                     (r"[<]+$","")]:
+        em = re.sub(pat, rep, em, flags=re.I)
+    em = em.strip().lower()
+    if not em or "@" not in em or "." not in em: return ""
+    if not re.match(r"^[a-zA-Z0-9]", em): return ""
+    at = em.rfind("@")
+    if at == -1: return ""
+    local, domain = em[:at], em[at+1:]
+    if ".mu" in domain:
+        domain = re.sub(r"\.mu.*", ".mu", domain, flags=re.I)
+    elif ".uk" in domain:
+        domain = re.sub(r"\.uk.*", ".uk", domain, flags=re.I)
+    else:
+        # v7: truncate right after the first recognized TLD so trailing junk
+        # (e.g. "comtak" from "mammoet.comtak") is correctly removed.
+        m = re.search(rf"^([a-z0-9.\-]+\.(?:{_TLD_RE_PART}))(?:[a-z0-9].*)?$", domain, re.I)
+        if m:
+            domain = m.group(1)
+        else:
+            domain = re.sub(r"(\.[a-z]{2,6})[a-z0-9\-_/?#+]*$", r"\1", domain, flags=re.I)
+    em = local + "@" + domain
+    if not em or "@" not in em or "." not in em: return ""
+    if not re.match(r"^[a-zA-Z0-9]", em): return ""
+    return em
+
+def clean_application_link(raw: str) -> str:
+    if not raw: return ""
+    raw = raw.strip()
+    # ── Block LinkedIn URLs in application links ──────────────────────────────
+    if is_linkedin_url(raw):
+        log.info(f"Blanking LinkedIn application URL: {raw}")
+        return ""
+    if "@" in raw and not raw.startswith("http"): return clean_email(raw)
+    if raw.startswith("http"):
+        url = raw
+        if ".mu" in url.lower():
+            def mu_replace(m):
+                tld, path = m.group(1), m.group(2) or ""
+                if path and re.match(r"^/[a-z0-9\-/]+$", path, re.I): return tld + path
+                return tld
+            url = re.sub(r"(\.mu)(\/[^\s]*)?$", mu_replace, url, flags=re.I)
+        url = re.sub(r"#.*$", "", url)
+        url = re.sub(r"(subject|applysubject|refno|applyref|applyhere|clickhere|applynow)(\?.*)?$","",url,flags=re.I)
+        url = re.sub(r"[.,;:!?)]+$", "", url)
+        return url.strip()
+    return raw
+
+def clean_logo_url(raw: str) -> str:
+    if not raw: return ""
+    raw = decode_html_entities(raw).strip()
+    if not raw.startswith("http"): return ""
+    return re.sub(r"[\"')\s]+$", "", raw)
+
+def is_placeholder_logo(url: str) -> bool:
+    """Detect LinkedIn ghost/placeholder/login-wall logos that shouldn't be trusted."""
+    if not url: return True
+    l = url.lower()
+    return any(k in l for k in [
+        "ghost", "placeholder", "static.licdn.com/aero-v1/sc/h/"
+        "9c8pery4andzj6ohjkjp54ms4", "default-company-logo",
+        # v7: LinkedIn login-wall favicon
+        "static.licdn.com/scds/common/u/images/logos/favicons",
+        "favicon",
+    ])
+
+# =============================================================================
+#  EMAIL HELPERS
+# =============================================================================
+
+def extract_email_from_text(text: str) -> str:
+    if not text: return ""
+    emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
+    for raw_em in emails:
+        em = clean_email(raw_em)
+        if not em or "@" not in em: continue
+        parts = em.split("@")
+        if len(parts) != 2: continue
+        if any(em.find(d) != -1 for d in NOISE_EMAIL_DOMAINS): continue
+        if FAKE_LOCAL_RE.match(parts[0]) or FAKE_DOMAIN_RE.match(parts[1]): continue
+        return em
+    return ""
+
+def scan_page_for_email(soup: BeautifulSoup, raw_html: str = "") -> str:
+    for tag in soup.find_all("a", href=re.compile(r"^mailto:", re.I)):
+        em = clean_email(tag.get("href", ""))
+        if not em: continue
+        if any(d in em for d in NOISE_EMAIL_DOMAINS): continue
+        parts = em.split("@")
+        if len(parts) == 2 and not FAKE_LOCAL_RE.match(parts[0]) and not FAKE_DOMAIN_RE.match(parts[1]):
+            return em
+    for sel in ["footer","#footer",".footer","#contact",".contact"]:
+        for tag in soup.select(sel):
+            found = extract_email_from_text(tag.get_text())
+            if found: return found
+    body = extract_email_from_text(soup.get_text())
+    if body: return body
+    if raw_html:
+        obs = re.findall(
+            r"[a-zA-Z0-9._%+\-]+\s*[\[\(]?\s*at\s*[\]\)]?\s*[a-zA-Z0-9.\-]+"
+            r"\s*[\[\(]?\s*dot\s*[\]\)]?\s*[a-zA-Z]{2,}", raw_html, re.I)
+        if obs:
+            norm = re.sub(r"\s*[\[\(]?\s*at\s*[\]\)]?\s*", "@", obs[0], flags=re.I)
+            norm = re.sub(r"\s*[\[\(]?\s*dot\s*[\]\)]?\s*", ".", norm, flags=re.I)
+            norm = re.sub(r"\s+", "", norm).lower()
+            if "@" in norm and not FAKE_LOCAL_RE.match(norm.split("@")[0]): return norm
+        found = extract_email_from_text(raw_html)
+        if found: return found
+    return ""
+
+# =============================================================================
+#  DECODE / FOLLOW LINKEDIN APPLY URL
+# =============================================================================
+
+def decode_linkedin_apply_url(raw: str) -> str:
+    if not raw: return ""
+    raw = decode_html_entities(raw)
+    if raw.startswith("http") and "linkedin.com" not in raw: return raw
+    m = re.search(r"[?&]url=([^&]+)", raw)
+    if m:
+        try:
+            d = unquote(m.group(1))
+            if "%" in d: d = unquote(d)
+            if d.startswith("http") and "linkedin.com" not in d: return d
+        except Exception: pass
+    b64m = re.search(r"[?&]offsiteApplyUrl=([^&]+)", raw)
+    if b64m:
+        try:
+            d2 = base64.b64decode(unquote(b64m.group(1))).decode("utf-8")
+            p = json.loads(d2)
+            if p and "url" in p: return p["url"]
+        except Exception: pass
+    return ""
+
+def follow_linkedin_apply_button(soup: BeautifulSoup, job_url: str) -> str:
+    for tag in soup.find_all("a", href=True):
+        ctrl = tag.get("data-tracking-control-name", "")
+        if "offsite" in ctrl.lower() or "apply" in ctrl.lower():
+            r = decode_linkedin_apply_url(tag["href"])
+            if r and not is_bad_url(r): return r
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]; text = tag.get_text().lower()
+        if ("apply" in text or "/apply" in href) and "linkedin.com" not in href:
+            if href.startswith("http") and not is_bad_url(href): return href
+    return ""
+
+# =============================================================================
+#  JSON-LD PARSER
+# =============================================================================
+
+def _parse_jsonld(html: str) -> dict:
+    result = {}
+    for raw in re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.S | re.I):
+        try:
+            data = json.loads(raw.strip())
+        except Exception:
+            continue
+        if isinstance(data, list):
+            data = next((d for d in data if isinstance(d, dict)), {})
+        if not isinstance(data, dict): continue
+        schema_type = data.get("@type", "")
+        if schema_type == "JobPosting":
+            org = data.get("hiringOrganization", {}) or {}
+            result.update({
+                "job_title":       data.get("title", ""),
+                "job_description": data.get("description", ""),
+                "date_posted":     data.get("datePosted", ""),
+                "valid_through":   data.get("validThrough", ""),
+                "employment_type": data.get("employmentType", ""),
+                "salary":          _extract_salary_jsonld(data.get("baseSalary", {})),
+                "company_name":    org.get("name", ""),
+                "company_logo":    clean_logo_url(
+                    org.get("logo", "") if isinstance(org.get("logo"), str) else
+                    org.get("logo", {}).get("url", "") if isinstance(org.get("logo"), dict) else ""),
+                "company_url":     org.get("sameAs", "") or org.get("url", ""),
+                "company_website": org.get("sameAs", "") or org.get("url", ""),
+                "apply_url":       (data.get("url", "") or
+                                    (data.get("applicationContact", {}) or {}).get("url", "")),
+                "location":        _extract_location_jsonld(data.get("jobLocation", {})),
+            })
+            addr = data.get("jobLocation", {})
+            if isinstance(addr, list): addr = addr[0] if addr else {}
+            place = addr.get("address", {}) if isinstance(addr, dict) else {}
+            if isinstance(place, dict):
+                city    = place.get("addressLocality", "")
+                country = place.get("addressCountry", "")
+                if city or country:
+                    result["location"] = ", ".join(filter(None, [city, country]))
+        elif schema_type in ("Organization", "Corporation", "LocalBusiness"):
+            result.update({
+                "company_name":     data.get("name", ""),
+                "company_logo":     clean_logo_url(
+                    data.get("logo", "") if isinstance(data.get("logo"), str) else
+                    data.get("logo", {}).get("url", "") if isinstance(data.get("logo"), dict) else ""),
+                "company_url":      data.get("sameAs", "") or data.get("url", ""),
+                "company_website":  data.get("sameAs", "") or data.get("url", ""),
+                "company_industry": data.get("industry", ""),
+                "company_founded":  str(data.get("foundingDate", "") or ""),
+                "company_address":  _extract_address_jsonld(data.get("address", {})),
+                "company_about":    data.get("description", ""),
+            })
+    return result
+
+def _extract_salary_jsonld(obj) -> str:
+    if not obj: return ""
+    if isinstance(obj, str): return obj
+    if isinstance(obj, dict):
+        val = obj.get("value", {}); currency = obj.get("currency", "")
+        if isinstance(val, dict):
+            lo = val.get("minValue", ""); hi = val.get("maxValue", ""); unit = val.get("unitText", "")
+            parts = [str(x) for x in [lo, hi] if x]
+            return f"{currency} {' - '.join(parts)} {unit}".strip()
+        return f"{currency} {val}".strip()
+    return ""
+
+def _extract_location_jsonld(obj) -> str:
+    if not obj: return ""
+    if isinstance(obj, list): obj = obj[0] if obj else {}
+    if not isinstance(obj, dict): return str(obj)
+    addr = obj.get("address", {})
+    if isinstance(addr, dict):
+        return ", ".join(filter(None, [
+            addr.get("addressLocality", ""),
+            addr.get("addressRegion", ""),
+            addr.get("addressCountry", ""),
+        ]))
+    return str(addr)
+
+def _extract_address_jsonld(obj) -> str:
+    if not obj: return ""
+    if isinstance(obj, str): return obj
+    if isinstance(obj, dict):
+        return ", ".join(filter(None, [
+            obj.get("streetAddress", ""),
+            obj.get("addressLocality", ""),
+            obj.get("addressRegion", ""),
+            obj.get("postalCode", ""),
+            obj.get("addressCountry", ""),
+        ]))
+    return ""
+
+# =============================================================================
+#  EXTRACT COMPANY DATA FROM JOB PAGE
+# =============================================================================
+
+def extract_company_from_job_page(html: str, soup: BeautifulSoup) -> dict:
+    result = {}
+    ld = _parse_jsonld(html)
+    if ld: result.update({k: v for k, v in ld.items() if v})
+
+    def _meta(name_or_prop: str) -> str:
+        tag = (soup.find("meta", attrs={"property": name_or_prop}) or
+               soup.find("meta", attrs={"name": name_or_prop}))
+        return (tag.get("content", "") if tag else "").strip()
+
+    og_image = _meta("og:image")
+    if og_image and not result.get("company_logo"):
+        result["company_logo"] = clean_logo_url(og_image)
+
+    def _sel(*selectors) -> str:
+        for s in selectors:
+            el = soup.select_one(s)
+            if el:
+                t = el.get_text(strip=True)
+                if t: return t
+        return ""
+
+    if not result.get("company_name"):
+        result["company_name"] = _sel(
+            ".topcard__org-name-link",
+            ".job-details-jobs-unified-top-card__company-name",
+            ".topcard__flavor",
+        )
+
+    if not result.get("company_logo"):
+        for img_sel in [".artdeco-entity-image","img.company-logo",
+                        ".jobs-unified-top-card__company-logo img",".topcard__logo img"]:
+            img = soup.select_one(img_sel)
+            if img:
+                src = img.get("src","") or img.get("data-delayed-url","") or img.get("data-ghost-url","")
+                src = clean_logo_url(src)
+                if src and "ghost" not in src.lower() and "placeholder" not in src.lower():
+                    result["company_logo"] = src; break
+
+    for chip in soup.select(
+        ".job-details-jobs-unified-top-card__job-insight,"
+        ".jobs-unified-top-card__job-insight,"
+        ".jobs-details__salary-main-rail-card"
+    ):
+        text = chip.get_text(strip=True)
+        if not result.get("company_industry") and re.search(
+                r"technology|consulting|financial|healthcare|education|"
+                r"manufacturing|retail|media|energy|real estate|"
+                r"construction|automotive|telecom|pharmaceutical", text, re.I):
+            result["company_industry"] = text
+
+    for script in soup.find_all("script"):
+        txt = script.string or ""
+        if not txt.strip(): continue
+        if not result.get("company_website"):
+            for pat in [r'"companyPageUrl"\s*:\s*"([^"]+)"',
+                        r'"companyUrl"\s*:\s*"([^"]+)"',
+                        r'"websiteUrl"\s*:\s*"([^"]+)"']:
+                m = re.search(pat, txt)
+                if m:
+                    url = _strip_li_tracking(decode_html_entities(m.group(1)))
+                    if url.startswith("http") and "linkedin.com" not in url:
+                        result["company_website"] = url; break
+        if not result.get("company_logo"):
+            for pat in [r'"logoUrl"\s*:\s*"([^"]+)"',
+                        r'"companyLogo"\s*:\s*"([^"]+)"',
+                        r'"logo"\s*:\s*"([^"]+)"']:
+                m = re.search(pat, txt)
+                if m:
+                    logo = clean_logo_url(decode_html_entities(m.group(1)))
+                    if logo: result["company_logo"] = logo; break
+        if not result.get("company_about"):
+            for pat in [r'"tagline"\s*:\s*"([^"]+)"', r'"description"\s*:\s*"([^"]{20,})"']:
+                m = re.search(pat, txt)
+                if m:
+                    about = decode_html_entities(m.group(1)).strip()
+                    if about and len(about) > 20: result["company_about"] = about; break
+
+    return result
+
+# =============================================================================
+#  v6: COMPANY-WEBSITE LOGO HUNTER
+# =============================================================================
+
+def _extract_logo_from_soup(soup: BeautifulSoup, base_url: str) -> str:
+    """
+    Search a single page's soup for the best candidate company logo.
+    Priority: JSON-LD Organization.logo > og:image (if logo-like) >
+              <link rel=icon/apple-touch-icon> (high-res) >
+              <img> with 'logo' in class/id/alt/src in header/nav/footer.
+    """
+    # 1. JSON-LD organization logo
+    for raw in re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            str(soup), re.S | re.I):
+        try:
+            data = json.loads(raw.strip())
+        except Exception:
+            continue
+        if isinstance(data, list):
+            data = next((d for d in data if isinstance(d, dict)), {})
+        if not isinstance(data, dict): continue
+        logo_field = data.get("logo")
+        if isinstance(logo_field, str) and logo_field:
+            cand = clean_logo_url(make_absolute(logo_field, base_url) if not logo_field.startswith("http") else logo_field)
+            if cand: return cand
+        if isinstance(logo_field, dict):
+            cand = clean_logo_url(logo_field.get("url", ""))
+            if cand: return cand
+        org = data.get("publisher") or data.get("hiringOrganization")
+        if isinstance(org, dict):
+            ologo = org.get("logo")
+            if isinstance(ologo, str) and ologo:
+                cand = clean_logo_url(make_absolute(ologo, base_url) if not ologo.startswith("http") else ologo)
+                if cand: return cand
+            if isinstance(ologo, dict):
+                cand = clean_logo_url(ologo.get("url", ""))
+                if cand: return cand
+
+    # 2. <img> elements explicitly tagged as logo, scoped to header/nav/footer first
+    LOGO_IMG_RE = re.compile(r"logo", re.I)
+    scopes = []
+    for sel in ["header", "nav", ".header", "#header", ".navbar", ".site-header"]:
+        scopes.extend(soup.select(sel))
+    scopes.append(soup)  # whole page fallback
+
+    for scope in scopes:
+        for img in scope.find_all("img"):
+            attrs_blob = " ".join(filter(None, [
+                img.get("class", []) and " ".join(img.get("class", [])),
+                img.get("id", ""), img.get("alt", ""), img.get("src", ""),
+                img.get("data-src", ""),
+            ]))
+            if LOGO_IMG_RE.search(attrs_blob):
+                src = (img.get("src") or img.get("data-src") or
+                       img.get("data-lazy-src") or img.get("data-original") or "")
+                src = clean_logo_url(make_absolute(src, base_url) if src and not src.startswith("http") else src)
+                if src and not is_placeholder_logo(src) and not src.lower().endswith((".svg",)) or \
+                   (src and src.lower().endswith(".svg")):
+                    if src:
+                        return src
+
+    # 3. og:image / twitter:image meta tags (often the logo or a brand image)
+    for prop in ["og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"]:
+        tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+        if tag:
+            content = tag.get("content", "")
+            if content:
+                cand = clean_logo_url(make_absolute(content, base_url) if not content.startswith("http") else content)
+                if cand and not is_placeholder_logo(cand):
+                    return cand
+
+    # 4. apple-touch-icon (usually high-res square brand mark)
+    for rel in ["apple-touch-icon", "apple-touch-icon-precomposed"]:
+        link = soup.find("link", rel=lambda r: r and rel in [x.lower() for x in (r if isinstance(r, list) else [r])])
+        if link:
+            href = link.get("href", "")
+            if href:
+                cand = clean_logo_url(make_absolute(href, base_url) if not href.startswith("http") else href)
+                if cand: return cand
+
+    # 5. standard favicon as last resort
+    for rel in ["icon", "shortcut icon"]:
+        link = soup.find("link", rel=lambda r: r and rel in [x.lower() for x in (r if isinstance(r, list) else [r])])
+        if link:
+            href = link.get("href", "")
+            if href:
+                cand = clean_logo_url(make_absolute(href, base_url) if not href.startswith("http") else href)
+                if cand: return cand
+
+    return ""
+
+
+def get_company_website_logo(website_url: str, about_url: str = "") -> str:
+    """
+    Visit the company's own website (homepage, then about page) to find a
+    proper, non-placeholder logo. Used as a fallback / override whenever
+    LinkedIn's logo is missing or looks like a ghost/placeholder image.
+    """
+    if not website_url or should_skip_crawl(website_url):
+        return ""
+    root = website_url.rstrip("/")
     try:
-        with open(FLAGGED_FILE, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                "LibyanJobs",
-                raw_job.get("title", ""),
-                raw_job.get("company_name", ""),
-                raw_job.get("location", ""),
-                raw_job.get("salary", ""),
-                raw_job.get("deadline", ""),
-                reason,
-                apply_note,
-                raw_job.get("job_url", ""),
-                datetime.now().isoformat(),
-            ])
+        time.sleep(0.4)
+        r = requests.get(root, headers=_next_headers(), timeout=12, allow_redirects=True)
+        if r.status_code == 200:
+            html = r.text[:FETCH_CHAR_LIMIT]
+            soup = BeautifulSoup(html, "html.parser")
+            logo = _extract_logo_from_soup(soup, root)
+            if logo:
+                log.info(f"company-site logo found on homepage: {logo}")
+                return logo
     except Exception as e:
-        log_.error(f"Flagged write error: {e}")
+        log.debug(f"get_company_website_logo home error ({root}): {e}")
+
+    if about_url and about_url != website_url:
+        try:
+            time.sleep(0.4)
+            r = requests.get(about_url, headers=_next_headers(), timeout=12, allow_redirects=True)
+            if r.status_code == 200:
+                html = r.text[:FETCH_CHAR_LIMIT]
+                soup = BeautifulSoup(html, "html.parser")
+                logo = _extract_logo_from_soup(soup, about_url)
+                if logo:
+                    log.info(f"company-site logo found on about page: {logo}")
+                    return logo
+        except Exception as e:
+            log.debug(f"get_company_website_logo about error ({about_url}): {e}")
+
+    return ""
+
+# =============================================================================
+#  v6: DEEP COMPANY WEBSITE CRAWLER — apply URL + email + enrichment
+# =============================================================================
+
+def crawl_company_website_deep(website_url: str, job_title: str) -> dict:
+    """
+    Multi-layer apply-URL hunter + company enrichment (v6):
+      1. Fetch company home page
+      2. Discover careers/jobs page via link text + URL patterns + HEAD probes
+      3. Fuzzy-match job title in anchor text AND surrounding context
+      4. Find the real Apply button; follow ATS redirect chains; detect mailto:
+      5. ALWAYS additionally harvest: logo, about/description, address,
+         founded year, industry, phone, social links — from home, about,
+         contact, and careers pages — regardless of whether an apply URL
+         was found, so missing company fields can be filled in.
+      6. Fall back gracefully at each layer.
+
+    Returns: {
+        "apply_url": str, "email": str, "method": str,
+        "logo": str, "about": str, "address": str, "founded": str,
+        "industry": str, "phone": str, "social_links": str,
+        "about_url": str, "careers_url": str,
+    }
+    """
+    result = {
+        "apply_url": "", "email": "", "method": "",
+        "logo": "", "about": "", "address": "", "founded": "",
+        "industry": "", "phone": "", "social_links": "",
+        "about_url": "", "careers_url": "",
+    }
+    if not website_url or should_skip_crawl(website_url):
+        return result
+
+    deadline    = time.time() + 25
+    root        = website_url.rstrip("/")
+    parsed_root = urlparse(root)
+    root_domain = parsed_root.netloc
+
+    def _get(url: str):
+        if time.time() > deadline: return None, None
+        try:
+            time.sleep(0.5)
+            r = requests.get(url, headers=_next_headers(), timeout=12, allow_redirects=True)
+            if r.status_code != 200: return None, None
+            html = r.text[:FETCH_CHAR_LIMIT]
+            return html, BeautifulSoup(html, "html.parser")
+        except Exception as e:
+            log.debug(f"deep crawl fetch error ({url}): {e}")
+            return None, None
+
+    def _same_domain_links(soup: BeautifulSoup, base: str) -> list:
+        out = []
+        for tag in soup.find_all("a", href=True):
+            href = make_absolute(tag.get("href", ""), base)
+            if not href or not href.startswith("http"): continue
+            if root_domain not in urlparse(href).netloc: continue
+            out.append((href, tag.get_text(strip=True).lower()))
+        return out
+
+    def _harvest_enrichment(soup: BeautifulSoup, html: str, page_url: str):
+        """Pull logo/about/address/founded/industry/phone/social from a page."""
+        full_text = soup.get_text(" ", strip=True)
+
+        if not result["logo"]:
+            logo = _extract_logo_from_soup(soup, page_url)
+            if logo and not is_placeholder_logo(logo):
+                result["logo"] = logo
+
+        if not result["email"]:
+            em = scan_page_for_email(soup, html)
+            if em: result["email"] = em
+
+        if not result["phone"]:
+            ph_patterns = [
+                r"\+\d[\d\s\-().]{7,18}\d",
+                r"\b0\d[\d\s\-().]{6,14}\d",
+                r"\(\d{2,4}\)\s*\d{3,4}[\s\-]\d{3,4}",
+            ]
+            for pat in ph_patterns:
+                ph_m = re.search(pat, full_text)
+                if ph_m:
+                    candidate = ph_m.group(0).strip()
+                    digits    = re.sub(r"\D", "", candidate)
+                    if 7 <= len(digits) <= 15:
+                        result["phone"] = candidate; break
+
+        if not result["address"]:
+            for el in soup.select(
+                "[itemprop='address'],[itemprop='streetAddress'],"
+                "[itemtype*='PostalAddress']"
+            ):
+                t = el.get_text(separator=", ", strip=True)
+                if len(t) > 10:
+                    result["address"] = t[:250]; break
+            if not result["address"]:
+                addr_m = re.search(
+                    r"\d+[\w\s,.\-]{5,120}"
+                    r"(?:street|st\b|avenue|ave\b|road|rd\b|boulevard|blvd|"
+                    r"lane|ln\b|drive|dr\b|way\b|close|court|building|floor|"
+                    r"suite|tower|plaza|district|zone|p\.?\s*o\.?\s*box|"
+                    r"tripoli|benghazi|misrata|zawiya|bayda|tobruk|"
+                    r"sirte|sebha|zliten|ajdabiya",
+                    full_text, re.I)
+                if addr_m:
+                    result["address"] = addr_m.group(0).strip()[:250]
+
+        if not result["founded"]:
+            fy = re.search(
+                r"(?:founded|established|incorporated|since|est\.?)\s*[:\-]?\s*((?:19|20)\d{2})",
+                full_text, re.I)
+            if fy: result["founded"] = fy.group(1)
+
+        if not result["about"]:
+            og = (soup.find("meta", property="og:description") or
+                  soup.find("meta", attrs={"name": "description"}))
+            if og:
+                desc = og.get("content", "").strip()
+                if len(desc) > 40:
+                    result["about"] = desc[:600]
+            if not result["about"]:
+                for p in soup.find_all("p"):
+                    t = p.get_text(strip=True)
+                    if len(t) > 80:
+                        result["about"] = t[:600]; break
+
+        if not result["industry"]:
+            meta_kw = ""
+            kw_tag = soup.find("meta", attrs={"name": "keywords"})
+            if kw_tag: meta_kw = kw_tag.get("content", "")
+            combined_for_industry = (meta_kw + " " + full_text[:1500]).lower()
+            for label, keywords in INDUSTRY_KEYWORDS:
+                if any(k in combined_for_industry for k in keywords):
+                    result["industry"] = label; break
+
+        if not result["social_links"]:
+            socials = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"].lower()
+                for platform in ["twitter.com","x.com","facebook.com","instagram.com",
+                                  "linkedin.com","youtube.com","tiktok.com"]:
+                    if platform in href and a["href"] not in socials:
+                        socials.append(a["href"]); break
+            if socials:
+                result["social_links"] = ", ".join(socials[:5])
+
+    # STEP 1 — Home page
+    home_html, home_soup = _get(root)
+    if not home_html:
+        log.info(f"deep crawl: could not fetch home page {root}")
+        return result
+
+    home_links = _same_domain_links(home_soup, root)
+
+    # Harvest enrichment data from homepage + footer immediately
+    footer = (home_soup.find("footer") or
+              home_soup.select_one("#footer,.footer,[class*='footer']"))
+    if footer:
+        _harvest_enrichment(BeautifulSoup(str(footer), "html.parser"), str(footer), root)
+    _harvest_enrichment(home_soup, home_html, root)
+
+    # STEP 2 — Find the careers page
+    CAREER_TEXT_RE = re.compile(
+        r"career|job|vacanc|opportunit|recruit|hiring|join\s*us|work\s*with\s*us|"
+        r"open\s*positions?|current\s*openings?|we['']?re\s+hiring", re.I)
+
+    careers_url = ""
+    for href, txt in home_links:
+        if CAREER_TEXT_RE.search(txt) or is_career_url(href):
+            careers_url = href
+            log.info(f"deep crawl: careers page from home link → {careers_url}")
+            break
+
+    if not careers_url:
+        for path in ["/careers","/jobs","/job-openings","/vacancies",
+                     "/work-with-us","/join-us","/opportunities",
+                     "/careers/open-positions","/about/careers",
+                     "/career","/recruitment","/join","/we-are-hiring",
+                     "/careers.html","/jobs.html"]:
+            if time.time() > deadline: break
+            candidate = root + path
+            try:
+                r = requests.head(candidate, headers=_next_headers(),
+                                  timeout=6, allow_redirects=True)
+                if r.status_code == 200:
+                    careers_url = candidate
+                    log.info(f"deep crawl: careers page from HEAD probe → {careers_url}")
+                    break
+            except Exception:
+                pass
+
+    result["careers_url"] = careers_url
+
+    # STEP 2b — Find the about page (for enrichment + logo fallback)
+    about_url = ""
+    for href, txt in home_links:
+        if is_about_url(href) or "about" in txt:
+            about_url = href; break
+    if not about_url:
+        for path in ["/about","/about-us","/our-story","/company","/who-we-are",
+                      "/about.html","/about-us.html"]:
+            if time.time() > deadline: break
+            candidate = root + path
+            try:
+                r = requests.head(candidate, headers=_next_headers(),
+                                  timeout=6, allow_redirects=True)
+                if r.status_code == 200:
+                    about_url = candidate; break
+            except Exception:
+                pass
+    result["about_url"] = about_url
+
+    if about_url and time.time() < deadline:
+        about_html, about_soup = _get(about_url)
+        if about_soup:
+            _harvest_enrichment(about_soup, about_html, about_url)
+
+    # STEP 2c — Contact page (enrichment: email/phone/address)
+    contact_url = ""
+    for href, txt in home_links:
+        if is_contact_url(href) or "contact" in txt:
+            contact_url = href; break
+    if not contact_url:
+        for path in ["/contact","/contact-us","/reach-us","/get-in-touch",
+                      "/contact.html","/contact-us.html"]:
+            if time.time() > deadline: break
+            candidate = root + path
+            try:
+                r = requests.head(candidate, headers=_next_headers(),
+                                  timeout=6, allow_redirects=True)
+                if r.status_code == 200:
+                    contact_url = candidate; break
+            except Exception:
+                pass
+
+    if contact_url and time.time() < deadline:
+        contact_html, contact_soup = _get(contact_url)
+        if contact_soup:
+            _harvest_enrichment(contact_soup, contact_html, contact_url)
+
+    # If still no logo, try a dedicated logo hunt (homepage already tried,
+    # but re-attempt with about page too)
+    if not result["logo"]:
+        logo = get_company_website_logo(root, about_url)
+        if logo:
+            result["logo"] = logo
+
+    # If no careers page, still scan home/about/contact for an email and return
+    if not careers_url:
+        log.info(f"deep crawl: no careers page found at {root}")
+        if result["email"]:
+            result["method"] = "deep_site_email"
+        return result
+
+    # STEP 3 — Find the specific job listing on the careers page
+    careers_html, careers_soup = _get(careers_url)
+    if not careers_soup:
+        return result
+
+    # Harvest enrichment from careers page too (sometimes about info lives there)
+    _harvest_enrichment(careers_soup, careers_html, careers_url)
+
+    career_links          = _same_domain_links(careers_soup, careers_url)
+    best_url, best_score  = "", 0.0
+
+    for href, anchor_txt in career_links:
+        if any(skip in href.lower() for skip in ["#","login","sign-in","signup",
+                                                   "register","privacy","terms"]):
+            continue
+        score = _title_similarity(job_title, anchor_txt)
+        for tag in careers_soup.find_all("a", href=True):
+            abs_href = make_absolute(tag.get("href", ""), careers_url)
+            if abs_href != href: continue
+            parent = tag.parent
+            if parent:
+                context_txt = parent.get_text(separator=" ", strip=True).lower()
+                ctx_score   = _title_similarity(job_title, context_txt)
+                score       = max(score, ctx_score * 0.85)
+            break
+        if score > best_score:
+            best_score, best_url = score, href
+
+    email_from_careers = result["email"] or scan_page_for_email(careers_soup, careers_html)
+    if email_from_careers and not result["email"]:
+        result["email"] = email_from_careers
+
+    if best_score < 0.30:
+        log.info(f"deep crawl: no close title match (best={best_score:.2f}) on careers page")
+        if email_from_careers:
+            result["apply_url"] = ""
+            result["method"]    = "deep_careers_email"
+            return result
+        result["apply_url"] = careers_url
+        result["method"]    = "deep_careers_page"
+        return result
+
+    log.info(f"deep crawl: matched '{job_title}' → {best_url}  (score={best_score:.2f})")
+
+    # STEP 4 — Job detail page: find the real Apply button
+    job_html, job_soup = _get(best_url)
+    if not job_soup:
+        result["apply_url"] = best_url
+        result["method"]    = "deep_job_page_url"
+        return result
+
+    # Harvest enrichment from the matched job page too (often has company blurb)
+    _harvest_enrichment(job_soup, job_html, best_url)
+
+    APPLY_TEXT_RE  = re.compile(
+        r"apply\s*now|apply\s*online|apply\s*for\s+this|apply\s*here|"
+        r"submit\s*(your\s*)?(application|cv|resume)|send\s*(cv|resume|application)|"
+        r"click\s*to\s*apply|start\s*application", re.I)
+    APPLY_CLASS_RE = re.compile(
+        r"apply|btn[-_]?apply|cta[-_]?apply|job[-_]?apply|application[-_]?btn", re.I)
+
+    apply_url = ""
+
+    for tag in job_soup.find_all("a", href=True):
+        tag_text = tag.get_text(strip=True)
+        tag_cls  = " ".join(tag.get("class", []))
+        href     = make_absolute(tag.get("href", ""), best_url)
+        if not href: continue
+        if href.lower().startswith("mailto:"):
+            em = clean_email(href.replace("mailto:", "").replace("MAILTO:", ""))
+            if em:
+                log.info(f"deep crawl: mailto apply found → {em}")
+                result["apply_url"] = ""
+                result["email"]     = result["email"] or em
+                result["method"]    = "deep_apply_email"
+                return result
+        if APPLY_TEXT_RE.search(tag_text) or APPLY_CLASS_RE.search(tag_cls):
+            resolved = _follow_redirect_chain(href) if is_ats_url(href) else href
+            if resolved and not is_bad_url(resolved):
+                apply_url = resolved
+                log.info(f"deep crawl: apply button found → {apply_url}")
+                break
+
+    if not apply_url:
+        for btn in job_soup.find_all("button"):
+            if APPLY_TEXT_RE.search(btn.get_text(strip=True)):
+                data_href = btn.get("data-href", "") or btn.get("data-url", "")
+                if data_href:
+                    href = make_absolute(data_href, best_url)
+                    if href and not is_bad_url(href):
+                        apply_url = href; break
+
+    if not apply_url:
+        for form in job_soup.find_all("form"):
+            action = make_absolute(form.get("action", ""), best_url)
+            if action and not is_bad_url(action) and "apply" in action.lower():
+                apply_url = action; break
+
+    if not apply_url:
+        for tag in job_soup.find_all("a", href=True):
+            href = make_absolute(tag.get("href", ""), best_url)
+            if href and is_ats_url(href) and not is_bad_url(href):
+                apply_url = _follow_redirect_chain(href)
+                log.info(f"deep crawl: ATS link found on job page → {apply_url}")
+                break
+
+    if not apply_url:
+        em = scan_page_for_email(job_soup, job_html)
+        if em and not result["email"]:
+            result["email"] = em
+        if em:
+            result["apply_url"] = ""
+            result["method"]    = "deep_job_email"
+            return result
+
+    if apply_url:
+        result["apply_url"] = apply_url
+        result["method"]    = "deep_apply_button"
+        return result
+
+    result["apply_url"] = best_url
+    result["method"]    = "deep_job_page_url"
+    return result
+
+# =============================================================================
+#  v6: ABOUT / CONTACT / FOOTER SCRAPER (standalone, used when deep crawl
+#      is skipped, e.g. because an apply URL was already found upstream)
+# =============================================================================
+
+def scrape_about_contact_footer(website_url: str) -> dict:
+    """
+    Visit home, about, contact, and careers pages to harvest missing
+    company details: address, phone, email, founded, description,
+    industry, social links, and logo.
+    """
+    empty = {"address": "", "phone": "", "email": "",
+             "founded": "", "description": "", "social_links": "",
+             "logo": "", "industry": ""}
+    if not website_url or should_skip_crawl(website_url): return dict(empty)
+
+    root        = website_url.rstrip("/")
+    parsed_root = urlparse(root)
+    root_domain = parsed_root.netloc
+    deadline    = time.time() + 18
+
+    def _get(url: str):
+        if time.time() > deadline: return None, None
+        try:
+            time.sleep(0.5)
+            r = requests.get(url, headers=_next_headers(), timeout=12, allow_redirects=True)
+            if r.status_code != 200: return None, None
+            html = r.text[:FETCH_CHAR_LIMIT]
+            return html, BeautifulSoup(html, "html.parser")
+        except Exception as e:
+            log.debug(f"about/contact fetch error ({url}): {e}")
+            return None, None
+
+    result = dict(empty)
+
+    def _harvest(soup: BeautifulSoup, html: str, page_url: str):
+        full_text = soup.get_text(" ", strip=True)
+
+        if not result["logo"]:
+            logo = _extract_logo_from_soup(soup, page_url)
+            if logo and not is_placeholder_logo(logo):
+                result["logo"] = logo
+
+        if not result["email"]:
+            em = scan_page_for_email(soup, html)
+            if em: result["email"] = em
+
+        if not result["phone"]:
+            ph_patterns = [
+                r"\+\d[\d\s\-().]{7,18}\d",
+                r"\b0\d[\d\s\-().]{6,14}\d",
+                r"\(\d{2,4}\)\s*\d{3,4}[\s\-]\d{3,4}",
+            ]
+            for pat in ph_patterns:
+                ph_m = re.search(pat, full_text)
+                if ph_m:
+                    candidate = ph_m.group(0).strip()
+                    digits    = re.sub(r"\D", "", candidate)
+                    if 7 <= len(digits) <= 15:
+                        result["phone"] = candidate; break
+
+        if not result["address"]:
+            for el in soup.select(
+                "[itemprop='address'],[itemprop='streetAddress'],"
+                "[itemtype*='PostalAddress']"
+            ):
+                t = el.get_text(separator=", ", strip=True)
+                if len(t) > 10:
+                    result["address"] = t[:250]; break
+            if not result["address"]:
+                addr_m = re.search(
+                    r"\d+[\w\s,.\-]{5,120}"
+                    r"(?:street|st\b|avenue|ave\b|road|rd\b|boulevard|blvd|"
+                    r"lane|ln\b|drive|dr\b|way\b|close|court|building|floor|"
+                    r"suite|tower|plaza|district|zone|p\.?\s*o\.?\s*box|"
+                    r"tripoli|benghazi|misrata|zawiya|bayda|tobruk|"
+                    r"sirte|sebha|zliten|ajdabiya",
+                    full_text, re.I)
+                if addr_m:
+                    result["address"] = addr_m.group(0).strip()[:250]
+
+        if not result["founded"]:
+            fy = re.search(
+                r"(?:founded|established|incorporated|since|est\.?)\s*[:\-]?\s*((?:19|20)\d{2})",
+                full_text, re.I)
+            if fy: result["founded"] = fy.group(1)
+
+        if not result["description"]:
+            og = (soup.find("meta", property="og:description") or
+                  soup.find("meta", attrs={"name": "description"}))
+            if og:
+                desc = og.get("content", "").strip()
+                if len(desc) > 40:
+                    result["description"] = desc[:600]
+            if not result["description"]:
+                for p in soup.find_all("p"):
+                    t = p.get_text(strip=True)
+                    if len(t) > 80:
+                        result["description"] = t[:600]; break
+
+        if not result["industry"]:
+            meta_kw = ""
+            kw_tag = soup.find("meta", attrs={"name": "keywords"})
+            if kw_tag: meta_kw = kw_tag.get("content", "")
+            combined_for_industry = (meta_kw + " " + full_text[:1500]).lower()
+            for label, keywords in INDUSTRY_KEYWORDS:
+                if any(k in combined_for_industry for k in keywords):
+                    result["industry"] = label; break
+
+        if not result["social_links"]:
+            socials = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"].lower()
+                for platform in ["twitter.com","x.com","facebook.com","instagram.com",
+                                  "linkedin.com","youtube.com","tiktok.com"]:
+                    if platform in href and a["href"] not in socials:
+                        socials.append(a["href"]); break
+            if socials:
+                result["social_links"] = ", ".join(socials[:5])
+
+    home_html, home_soup = _get(root)
+    if home_soup:
+        footer = (home_soup.find("footer") or
+                  home_soup.select_one("#footer,.footer,[class*='footer']"))
+        if footer:
+            _harvest(BeautifulSoup(str(footer), "html.parser"), str(footer), root)
+        _harvest(home_soup, home_html, root)
+
+        about_url = contact_url = careers_url = ""
+        for tag in home_soup.find_all("a", href=True):
+            href = make_absolute(tag.get("href", ""), root)
+            if not href or root_domain not in urlparse(href).netloc: continue
+            txt = tag.get_text(strip=True).lower()
+            if not about_url and (is_about_url(href) or "about" in txt):
+                about_url = href
+            if not contact_url and (is_contact_url(href) or "contact" in txt):
+                contact_url = href
+            if not careers_url and (is_career_url(href) or "career" in txt or "job" in txt):
+                careers_url = href
+            if about_url and contact_url and careers_url: break
+
+        if not about_url and time.time() < deadline:
+            for path in ["/about","/about-us","/our-story","/company","/who-we-are"]:
+                try:
+                    r = requests.head(root + path, headers=_next_headers(),
+                                      timeout=5, allow_redirects=True)
+                    if r.status_code == 200:
+                        about_url = root + path; break
+                except Exception:
+                    pass
+
+        if not contact_url and time.time() < deadline:
+            for path in ["/contact","/contact-us","/reach-us","/get-in-touch"]:
+                try:
+                    r = requests.head(root + path, headers=_next_headers(),
+                                      timeout=5, allow_redirects=True)
+                    if r.status_code == 200:
+                        contact_url = root + path; break
+                except Exception:
+                    pass
+
+        if not careers_url and time.time() < deadline:
+            for path in ["/careers","/jobs","/vacancies","/work-with-us","/join-us"]:
+                try:
+                    r = requests.head(root + path, headers=_next_headers(),
+                                      timeout=5, allow_redirects=True)
+                    if r.status_code == 200:
+                        careers_url = root + path; break
+                except Exception:
+                    pass
+
+        if about_url and time.time() < deadline:
+            about_html, about_soup = _get(about_url)
+            if about_soup: _harvest(about_soup, about_html, about_url)
+
+        if contact_url and time.time() < deadline:
+            contact_html, contact_soup = _get(contact_url)
+            if contact_soup: _harvest(contact_soup, contact_html, contact_url)
+
+        if careers_url and time.time() < deadline:
+            careers_html, careers_soup = _get(careers_url)
+            if careers_soup: _harvest(careers_soup, careers_html, careers_url)
+
+    if not result["logo"]:
+        logo = get_company_website_logo(root)
+        if logo: result["logo"] = logo
+
+    return result
+
+# =============================================================================
+#  COMPANY PAGE SCRAPER  (LinkedIn)
+# =============================================================================
+
+def scrape_company_details(company_url: str) -> dict:
+    empty = {
+        "name":"","industry":"","size":"","headquarters":"","type":"",
+        "founded":"","specialties":"","website":"","logo":"","about":"",
+        "company_url":"",
+    }
+    if not company_url: return dict(empty)
+    log.info(f"Scraping company page: {company_url}")
+    base_url = re.sub(r"\?.*$", "", company_url.rstrip("/"))
+    html     = None
+    guest_url = base_url.replace(
+        "https://www.linkedin.com/company/",
+        "https://www.linkedin.com/company-guest/",
+    )
+    if guest_url != base_url: html = fetch_page(guest_url)
+    if not html:
+        for attempt in range(3):
+            try:
+                time.sleep(1.5 + attempt * 2)
+                r = requests.get(base_url, headers=_next_headers(),
+                                 allow_redirects=True, timeout=20)
+                if r.status_code == 429:
+                    log.warning("Company page rate-limited — sleeping 60s"); time.sleep(60); continue
+                if r.status_code == 200:
+                    text = r.text
+                    if len(text) > FETCH_CHAR_LIMIT: text = text[:FETCH_CHAR_LIMIT]
+                    html = text; break
+                log.warning(f"Company page HTTP {r.status_code}: {base_url}"); break
+            except Exception as e:
+                log.warning(f"Company page fetch error (attempt {attempt+1}): {e}")
+                time.sleep(2 + attempt * 2)
+    if not html:
+        result = dict(empty)
+        result["company_url"] = base_url
+        return result
+
+    soup = BeautifulSoup(html, "html.parser")
+    ld   = _parse_jsonld(html)
+
+    def _sel(*selectors) -> str:
+        for s in selectors:
+            el = soup.select_one(s)
+            if el:
+                t = el.get_text(strip=True)
+                if t: return t
+        return ""
+
+    def _get_detail(label: str) -> str:
+        lower = label.lower()
+        for div in soup.select("section.core-section-container dl > div"):
+            dt = div.find("dt")
+            if dt and lower in dt.get_text().strip().lower():
+                dd = div.find("dd")
+                if dd: return dd.get_text(strip=True)
+        for row in soup.select(".org-page-details__definition-list dt, .about-us__basicInfo dt"):
+            if lower in row.get_text().strip().lower():
+                dd = row.find_next_sibling("dd")
+                if dd: return dd.get_text(strip=True)
+        return ""
+
+    og_img_tag = (soup.find("meta", property="og:image") or
+                  soup.find("meta", attrs={"name": "og:image"}))
+    raw_logo = (og_img_tag.get("content", "") if og_img_tag else "") or ld.get("company_logo", "")
+    if not raw_logo:
+        for img in soup.select("img.org-top-card-primary-content__logo, img.artdeco-entity-image"):
+            src = img.get("src", "") or img.get("data-delayed-url", "")
+            if src and "ghost" not in src.lower():
+                raw_logo = src; break
+    logo = clean_logo_url(raw_logo)
+
+    ws_tag  = soup.select_one("a[data-tracking-control-name='about_website']")
+    raw_ws  = (ws_tag.get("href", "") if ws_tag else "") or _get_detail("Website") or ld.get("company_website", "")
+    website = decode_linkedin_apply_url(raw_ws) or raw_ws
+    # Blank if still LinkedIn
+    website = blank_if_linkedin(website)
+
+    name = (ld.get("company_name", "") or _sel("h1.org-top-card-summary__title", "h1", "title") or "")
+    if " | LinkedIn" in name: name = name.split(" | ")[0].strip()
+
+    about = (ld.get("company_about", "") or
+             _sel("section.about-us p", ".core-section-container__content p",
+                  ".org-about-us-organization-description__text",
+                  ".org-about-module__description") or "")
+
+    return {
+        "name":         name,
+        "industry":     _get_detail("Industry") or ld.get("company_industry", ""),
+        "size":         _get_detail("Company size"),
+        "headquarters": _get_detail("Headquarters") or ld.get("company_address", ""),
+        "type":         _get_detail("Type"),
+        "founded":      _get_detail("Founded") or ld.get("company_founded", ""),
+        "specialties":  _get_detail("Specialties"),
+        "website":      website,
+        "logo":         logo,            # raw LinkedIn logo — may be placeholder/empty
+        "about":        about,
+        "company_url":  base_url,        # LinkedIn company page URL — kept!
+    }
+
+# =============================================================================
+#  WORDPRESS LOGO UPLOAD
+# =============================================================================
+
+def upload_logo_to_wordpress(logo_url: str, company_name: str) -> str:
+    if not logo_url or not logo_url.startswith("http") or not WP_USER: return ""
+    try:
+        r = requests.get(logo_url, headers={"User-Agent": HEADERS["User-Agent"],
+                                             "Referer": "https://www.linkedin.com/"}, timeout=15)
+        if r.status_code != 200: return ""
+        ct  = r.headers.get("Content-Type", "image/jpeg")
+        ext = "png" if "png" in ct else "jpg"
+        fn  = re.sub(r"[^a-z0-9]", "-", company_name.lower()) + "-logo." + ext
+        creds = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
+        wr    = requests.post(WP_URL + "media",
+                              headers={"Authorization": "Basic " + creds,
+                                       "Content-Disposition": f"attachment; filename={fn}",
+                                       "Content-Type": ct},
+                              data=r.content, timeout=20)
+        if wr.status_code in (200, 201): return wr.json().get("source_url", "")
+        log.warning(f"WP upload failed ({wr.status_code})")
+    except Exception as e:
+        log.warning(f"uploadLogoToWordPress: {e}")
+    return ""
+
+# =============================================================================
+#  v3 COMPANY WEBSITE CRAWLER  (fallback)
+# =============================================================================
+
+def crawl_company_website(website_url: str, job_title: str) -> dict:
+    log.info(f"Crawling company site (v3 fallback): {website_url}")
+    if should_skip_crawl(website_url):
+        return {"url": website_url, "email": "", "method": "fallback_website"}
+    deadline = time.time() + 12
+    root_url = website_url.rstrip("/")
+
+    def get(url):
+        if time.time() > deadline: return None
+        try:
+            time.sleep(0.5)
+            r = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+            if r.status_code != 200: return None
+            t = r.text
+            return t[:FETCH_CHAR_LIMIT] if len(t) > FETCH_CHAR_LIMIT else t
+        except Exception: return None
+
+    home_html = get(root_url)
+    if not home_html: return {"url": "", "email": "", "method": ""}
+    soup_h     = BeautifulSoup(home_html, "html.parser")
+    home_email = scan_page_for_email(soup_h, home_html)
+    if home_email: return {"url": "", "email": home_email, "method": "s7_homepage_email"}
+
+    careers_url = contact_url = ""
+    for tag in soup_h.find_all("a", href=True):
+        href      = make_absolute(tag.get("href", ""), root_url)
+        link_text = tag.get_text().lower()
+        if not href or is_bad_url(href) or href == root_url: continue
+        if root_url not in href: continue
+        if not careers_url and is_career_url(href): careers_url = href
+        if not contact_url and (is_contact_url(href) or "contact" in link_text): contact_url = href
+        if careers_url and contact_url: break
+
+    if careers_url and time.time() < deadline:
+        ch = get(careers_url)
+        if ch:
+            em = scan_page_for_email(BeautifulSoup(ch, "html.parser"), ch)
+            if em: return {"url": "", "email": em, "method": "s7_careers_email"}
+    if contact_url and time.time() < deadline:
+        cth = get(contact_url)
+        if cth:
+            em = scan_page_for_email(BeautifulSoup(cth, "html.parser"), cth)
+            if em: return {"url": "", "email": em, "method": "s7_contact_email"}
+    if careers_url: return {"url": careers_url, "email": "", "method": "s7_careers_page"}
+    return {"url": root_url, "email": "", "method": "fallback_website"}
+
+# =============================================================================
+#  APPLICATION DETAILS EXTRACTOR  (v6 priority chain)
+# =============================================================================
+
+def extract_application_details(
+    job_url: str,
+    soup: BeautifulSoup,
+    company_website: str,
+    ld: dict,
+    job_title: str = "",
+    site_info: dict | None = None,
+) -> dict:
+    """
+    Priority chain:
+      0  JSON-LD apply URL
+      1  LinkedIn "Apply" button on the job page
+      2  Script tags on the job page
+      3  v6 deep crawl: home → careers → job listing → Apply button
+         (also returns enrichment fields used by caller)
+      4  Links / URLs in the job description
+      5  Email from site_info (about/contact/footer scrape)
+      6  v3 company website fallback crawl
+
+    Returns dict with at minimum: url, email, method.
+    If step 3 (deep crawl) ran, the result also includes "_deep" with the
+    full enrichment dict (logo/about/address/founded/industry/etc.) so the
+    caller can use it even if no apply URL/email is ultimately chosen.
+    """
+    desc_text = ""
+    for sel in [".show-more-less-html__markup", ".description__text"]:
+        el = soup.select_one(sel)
+        if el: desc_text = el.get_text(); break
+
+    # ── 0. JSON-LD ───────────────────────────────────────────────────────────
+    if ld.get("apply_url") and not is_bad_url(ld["apply_url"]):
+        url = blank_if_linkedin(ld["apply_url"])
+        if url:
+            log.info(f"apply found via JSON-LD: {url}")
+            return {"url": url, "email": "", "method": "s0_jsonld"}
+
+    # ── 1. LinkedIn apply button ──────────────────────────────────────────────
+    apply_btn = follow_linkedin_apply_button(soup, job_url)
+    if apply_btn:
+        apply_btn = blank_if_linkedin(apply_btn)
+        if apply_btn:
+            log.info(f"apply found via LinkedIn button: {apply_btn}")
+            return {"url": apply_btn, "email": "", "method": "s0_apply_button"}
+
+    # ── 2. Script tags on job page ────────────────────────────────────────────
+    for script in soup.find_all("script"):
+        txt = script.string or ""
+        for pat in [r'"applyStartUrl"\s*:\s*"([^"]+)"',
+                    r'"applicationUrl"\s*:\s*"([^"]+)"']:
+            m = re.search(pat, txt)
+            if m:
+                cand = decode_html_entities(m.group(1)).replace("\\", "")
+                cand = blank_if_linkedin(cand)
+                if cand and cand.startswith("http") and not is_bad_url(cand):
+                    log.info(f"apply found via script tag: {cand}")
+                    return {"url": cand, "email": "", "method": "s1b_script_tag"}
+
+    # ── 3. Deep crawl company website (apply + enrichment) ───────────────────
+    deep_info = {}
+    if company_website and not should_skip_crawl(company_website):
+        log.info(f"v6 deep crawl starting: {company_website} for '{job_title}'")
+        deep_info = crawl_company_website_deep(company_website, job_title)
+        if deep_info.get("email"):
+            log.info(f"apply found via deep crawl (email): {deep_info['email']}")
+            return {"url": "", "email": deep_info["email"],
+                    "method": deep_info.get("method") or "deep_email", "_deep": deep_info}
+        if deep_info.get("apply_url") and not is_bad_url(deep_info["apply_url"]):
+            apply_url = blank_if_linkedin(deep_info["apply_url"])
+            if apply_url:
+                log.info(f"apply found via deep crawl (url): {apply_url}")
+                return {"url": apply_url, "email": "",
+                        "method": deep_info.get("method") or "deep_url", "_deep": deep_info}
+
+    # ── 4. Links / URLs in job description ────────────────────────────────────
+    desc_el = (soup.select_one(".show-more-less-html__markup") or
+               soup.select_one(".description__text"))
+    if desc_el:
+        for a in desc_el.find_all("a", href=True):
+            h = blank_if_linkedin(a.get("href", ""))
+            if h and not is_bad_url(h):
+                log.info(f"apply found via description link: {h}")
+                return {"url": h, "email": "", "method": "s3_desc_link", "_deep": deep_info}
+
+    for u in re.findall(r"https?://[^\s\"'<>)(,\]]+", desc_text):
+        u = re.sub(r"[.,;:!?)]+$", "", u)
+        u = blank_if_linkedin(u)
+        if u and not is_bad_url(u):
+            log.info(f"apply found via description URL: {u}")
+            return {"url": u, "email": "", "method": "s4_desc_url", "_deep": deep_info}
+
+    em = extract_email_from_text(desc_text)
+    if em:
+        log.info(f"apply found via description email: {em}")
+        return {"url": "", "email": em, "method": "s5_desc_email", "_deep": deep_info}
+
+    # ── 5. Email from site_info ────────────────────────────────────────────────
+    if site_info and site_info.get("email"):
+        log.info(f"apply found via site_info email: {site_info['email']}")
+        return {"url": "", "email": site_info["email"], "method": "site_info_email", "_deep": deep_info}
+
+    # ── 6. v3 fallback crawl ──────────────────────────────────────────────────
+    resolved = decode_linkedin_apply_url(company_website) or company_website
+    resolved = blank_if_linkedin(resolved)
+    if resolved and not is_bad_url(resolved):
+        if should_skip_crawl(resolved):
+            return {"url": resolved, "email": "", "method": "fallback_website", "_deep": deep_info}
+        res = crawl_company_website(resolved, job_title)
+        if res.get("email") or res.get("url"):
+            if res.get("url"): res["url"] = blank_if_linkedin(res["url"])
+            res["_deep"] = deep_info
+            return res
+        return {"url": resolved, "email": "", "method": "fallback_website", "_deep": deep_info}
+
+    return {"url": "", "email": "", "method": "not_found", "_deep": deep_info}
+
+# =============================================================================
+#  JOB CRITERIA HELPERS
+# =============================================================================
+
+def get_job_criteria(soup: BeautifulSoup, label: str) -> str:
+    lower = label.lower()
+    for li in soup.select(".description__job-criteria-list > li"):
+        h3 = li.find("h3")
+        if h3 and lower in h3.get_text().strip().lower():
+            spans = li.select(".description__job-criteria-text, span")
+            if spans: return spans[-1].get_text(strip=True)
+    for chip in soup.select(
+        ".job-details-jobs-unified-top-card__job-insight,"
+        ".jobs-unified-top-card__job-insight"):
+        text = chip.get_text(strip=True).lower()
+        if "employment" in lower or "type" in lower:
+            if re.search(r"full[\-\s]?time|part[\-\s]?time|contract|temporary|internship|freelance", text, re.I):
+                return chip.get_text(strip=True)
+        elif "seniority" in lower:
+            if re.search(r"entry|associate|mid[\-\s]?senior|senior|director|executive|intern", text, re.I):
+                return chip.get_text(strip=True)
+    meta_map = {"employment type": soup.find("meta", {"name": "employmentType"}),
+                "seniority level": soup.find("meta", {"name": "seniorityLevel"}),
+                "industries":      soup.find("meta", {"name": "industry"})}
+    tag = meta_map.get(lower)
+    if tag: return tag.get("content", "")
+    return ""
+
+def get_workplace_type(soup: BeautifulSoup) -> str:
+    for s in [".topcard__workplace-type",
+              ".job-details-jobs-unified-top-card__workplace-type",
+              ".jobs-unified-top-card__workplace-type"]:
+        el = soup.select_one(s)
+        if el: return el.get_text(strip=True)
+    for chip in soup.select(
+        ".job-details-jobs-unified-top-card__job-insight,"
+        ".jobs-unified-top-card__job-insight"):
+        t = chip.get_text(strip=True)
+        if re.match(r"^(remote|on[\-\s]?site|hybrid)$", t, re.I): return t
+    return ""
+
+# =============================================================================
+#  JOB FIELD INFERENCE
+# =============================================================================
+
+FIELD_KEYWORD_MAP = [
+    ("Information Technology",
+     ["software engineer","developer","devops","frontend","backend","full stack","fullstack",
+      "sysadmin","cloud","cybersecurity","data engineer","machine learning","artificial intelligence",
+      "ai/ml","it support","network engineer","database","kubernetes","docker","aws","azure",
+      "react","node.js","python developer","java developer"],
+     ["programming","coding","api","agile","scrum","git","linux","server","infrastructure","software"]),
+    ("Finance & Accounting",
+     ["accountant","auditor","finance manager","financial analyst","cfo","treasurer","tax",
+      "bookkeeper","payroll","budget analyst","credit analyst","investment","portfolio manager",
+      "risk analyst","forex","actuary","acca","cfa","cpa"],
+     ["financial","accounting","balance sheet","p&l","reconciliation","ifrs","gaap","ledger","invoicing"]),
+    ("Sales & Business Development",
+     ["sales executive","sales manager","business development","account manager",
+      "sales representative","bd manager","regional sales","key account","sales director",
+      "commercial manager","sales officer"],
+     ["revenue","pipeline","crm","leads","prospects","quota","target","upsell","cross-sell","b2b","b2c"]),
+    ("Marketing & Communications",
+     ["marketing manager","digital marketing","seo","sem","content marketer","social media manager",
+      "brand manager","marketing executive","communications manager","pr manager","copywriter",
+      "growth hacker","email marketing","campaign manager"],
+     ["marketing","branding","advertising","social media","content","campaign","analytics",
+      "google ads","facebook ads","influencer"]),
+    ("Human Resources",
+     ["hr manager","human resources","recruiter","talent acquisition","hr business partner",
+      "hrbp","hr officer","compensation","benefits manager","organisational development",
+      "learning and development","l&d","hr generalist","payroll manager"],
+     ["recruitment","onboarding","performance management","employee relations","hr","workforce"]),
+    ("Engineering",
+     ["mechanical engineer","civil engineer","electrical engineer","structural engineer",
+      "process engineer","project engineer","maintenance engineer","production engineer",
+      "quality engineer","safety engineer","site engineer","design engineer"],
+     ["engineering","cad","autocad","solidworks","manufacturing","plant","machinery","commissioning"]),
+    ("Healthcare & Medicine",
+     ["doctor","physician","nurse","pharmacist","medical officer","surgeon","anaesthetist",
+      "physiotherapist","radiographer","lab technician","clinical","healthcare manager",
+      "occupational therapist","dentist","midwife"],
+     ["hospital","clinic","patient","medical","health","pharmaceutical","diagnosis","treatment"]),
+    ("Education & Training",
+     ["teacher","lecturer","professor","trainer","educator","tutor","school principal",
+      "academic","curriculum","e-learning","instructional designer","teaching assistant"],
+     ["school","university","college","classroom","students","pedagogy","curriculum","education"]),
+    ("Hospitality & Tourism",
+     ["hotel manager","front desk","housekeeping","chef","sous chef","food and beverage",
+      "f&b manager","restaurant manager","bartender","waiter","concierge","tour guide",
+      "travel agent","events coordinator","catering"],
+     ["hospitality","hotel","resort","tourism","guest","accommodation","restaurant","kitchen"]),
+    ("Logistics & Supply Chain",
+     ["supply chain manager","logistics coordinator","warehouse manager","fleet manager",
+      "procurement manager","purchasing manager","import export","freight","shipping coordinator",
+      "inventory manager","demand planner"],
+     ["logistics","supply chain","warehouse","inventory","freight","procurement","sourcing"]),
+    ("Legal",
+     ["lawyer","attorney","legal counsel","paralegal","compliance officer","legal advisor",
+      "solicitor","barrister","corporate counsel","legal manager","contract manager"],
+     ["legal","law","contracts","litigation","regulatory","compliance","gdpr"]),
+    ("Administration & Operations",
+     ["office manager","executive assistant","administrative officer","operations manager",
+      "pa","personal assistant","receptionist","data entry","office administrator",
+      "company secretary","business analyst"],
+     ["administration","operations","office","coordination","scheduling","reporting","clerical"]),
+    ("Customer Service",
+     ["customer service","call centre","customer success","customer support","help desk",
+      "service advisor","client relations","customer experience","contact centre"],
+     ["customer","support","helpdesk","tickets","escalation","satisfaction","service level"]),
+    ("Construction & Real Estate",
+     ["quantity surveyor","site supervisor","project manager construction","architect",
+      "draughtsman","property manager","estate agent","real estate","building inspector",
+      "land surveyor","construction manager"],
+     ["construction","building","property","real estate","site","contractor","tender"]),
+    ("Manufacturing & Production",
+     ["production manager","quality control","quality assurance","qa","qc","factory manager",
+      "plant manager","production supervisor","assembly","cnc operator","technician"],
+     ["production","manufacturing","factory","assembly","quality","lean","six sigma"]),
+    ("Design & Creative",
+     ["graphic designer","ui/ux","product designer","art director","creative director",
+      "animator","illustrator","photographer","videographer","motion designer","web designer"],
+     ["design","creative","adobe","figma","photoshop","illustrator","indesign","sketch","branding"]),
+    ("Research & Science",
+     ["research scientist","data scientist","lab researcher","research analyst",
+      "clinical researcher","environmental scientist","chemist","biologist","statistician"],
+     ["research","analysis","data","laboratory","science","experiment","findings","methodology"]),
+    ("Security",
+     ["security officer","security guard","security manager","cctv","loss prevention",
+      "risk manager","health and safety","hse officer","osh","fire safety"],
+     ["security","safety","risk","surveillance","patrol","access control","emergency"]),
+    ("Media & Journalism",
+     ["journalist","editor","reporter","broadcast","news anchor","content creator",
+      "media manager","radio","television","producer","scriptwriter"],
+     ["media","journalism","broadcast","news","editorial","publishing","press"]),
+    ("Non-Profit & Social Work",
+     ["social worker","ngo","charity","programme coordinator","community development",
+      "welfare officer","case manager","development officer","fundraiser","volunteer coordinator"],
+     ["social","ngo","community","welfare","beneficiary","donor","impact","charity"]),
+]
+
+def infer_job_field(title: str, description: str) -> str:
+    if not title and not description: return ""
+    combined = ((title or "") + " " + (description or "")).lower()
+    best_field, best_score = "", 0
+    for label, high_keys, supporting in FIELD_KEYWORD_MAP:
+        score  = sum(3 for k in high_keys if k in combined)
+        score += sum(1 for k in supporting if k in combined)
+        if score > best_score: best_score, best_field = score, label
+    if best_score >= 3: return best_field
+    return ""
+
+# =============================================================================
+#  QUALIFICATION / EXPERIENCE EXTRACTORS
+# =============================================================================
+
+QUALIFICATION_TIERS = [
+    ("PhD / Doctorate",          ["phd","ph.d","doctorate","doctoral","doctor of philosophy"]),
+    ("Master's Degree",          ["master","msc","m.sc","ma ","m.a ","mba","m.b.a","meng","m.eng","mphil",
+                                   "postgraduate","post-graduate","post graduate"]),
+    ("Bachelor's Degree",        ["bachelor","bsc","b.sc","ba ","b.a ","beng","b.eng","bcom","b.com","bba",
+                                   "llb","degree in","undergraduate degree","honours degree","hons"]),
+    ("Higher National Diploma",  ["hnd","hnc","higher national diploma","higher national certificate",
+                                   "higher diploma","advanced diploma"]),
+    ("Diploma",                  ["diploma","dip ","dip.","associate degree","foundation degree"]),
+    ("Professional Certification",["acca","cpa","cfa","cima","pmp","prince2","cissp","aws certified",
+                                    "comptia","cisco","ccna","ccnp","shrm","cipd","chartered",
+                                    "certified public","certified financial","certified project",
+                                    "professional certification","professional certificate"]),
+    ("A-Levels / HSC",           ["a-level","a level","hsc","higher school certificate","ib diploma",
+                                   "international baccalaureate","gce advanced"]),
+    ("O-Levels / School Certificate",["o-level","o level","igcse","gcse","school certificate",
+                                       "sc ","cpe","certificate of primary"]),
+    ("No Formal Qualification Required",["no qualification","no degree","no formal","school leaver",
+                                          "entry level","no experience required","training provided","will train"]),
+]
+
+def extract_qualification(text: str) -> str:
+    if not text: return ""
+    if re.search(r"nursery|primary years|ib pyp|aged between|boys and girls", text, re.I): return ""
+    lower = text.lower()
+    for label, keywords in QUALIFICATION_TIERS:
+        if any(k in lower for k in keywords): return label
+    return ""
+
+NO_EXP_KW = ["no experience","no prior experience","fresh graduate","freshers",
+              "entry level","entry-level","0 years","zero experience",
+              "training provided","will train","no experience required"]
+LESS1_KW  = ["less than 1 year","under 1 year","6 months","less than a year",
+              "some experience","minimal experience"]
+
+def years_to_band(n: int) -> str:
+    if n <= 0:  return "No Experience Required"
+    if n <= 2:  return "1 - 2 Years"
+    if n <= 5:  return "3 - 5 Years"
+    if n <= 10: return "6 - 10 Years"
+    return "10+ Years"
+
+def extract_experience(text: str) -> str:
+    if not text: return ""
+    if re.search(r"aged?\s+between|boys\s+and\s+girls|nursery|primary\s+years|IB\s+PYP", text, re.I): return ""
+    lower = text.lower()
+    if any(k in lower for k in NO_EXP_KW): return "No Experience Required"
+    if any(k in lower for k in LESS1_KW):  return "Less than 1 Year"
+    patterns = [
+        r"(\d+)\s*[-–to]+\s*(\d+)\s*\+?\s*years?",
+        r"(\d+)\s*\+\s*years?\s*(?:of\s+)?(?:experience)?",
+        r"(?:minimum|at\s+least|over|more\s+than)\s+(\d+)\s*\+?\s*years?",
+        r"(\d+)\s*years?\s*(?:of\s+)?(?:relevant\s+)?(?:work\s+)?experience",
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            raw = int(m.group(1))
+            if raw > 20: continue
+            return years_to_band(raw)
+    return ""
+
+# =============================================================================
+#  JOB DETAIL SCRAPER  (v7 + paraphrase)
+# =============================================================================
+
+def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) -> dict | None:
+    """
+    Scrape a single LinkedIn job (v7 layers) then paraphrase key fields.
+    Returns the job dict or None.
+    """
+    job_id = make_job_id(job_url)
+    if job_id in processed_ids or job_url in processed_urls:
+        print(C_DIM(f"  ⧳ Already processed — skipped ({job_url})"))
+        return None
+
+    log.info(f"Scraping job: {job_url}")
+    try:
+        resp = requests.get(job_url, headers=_next_headers(), timeout=20)
+        if resp.status_code != 200: return None
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception as e:
+        log.warning(f"Job fetch failed: {e}"); return None
+
+    def sel_text(*selectors):
+        for s in selectors:
+            el = soup.select_one(s)
+            if el:
+                t = el.get_text(strip=True)
+                if t: return t
+        return ""
+
+    title = sel_text(".top-card-layout__title", "h1.topcard__title",
+                     ".job-details-jobs-unified-top-card__job-title", "h1")
+    if not title: return None
+
+    company_name_fallback = sel_text(
+        ".topcard__org-name-link",
+        ".job-details-jobs-unified-top-card__company-name",
+        ".topcard__flavor",
+    )
+    company_url_el = (soup.select_one(".topcard__org-name-link") or
+                      soup.select_one(".job-details-jobs-unified-top-card__company-name a"))
+    # companyUrl is the LinkedIn company page URL — kept in its own column
+    company_url_raw = company_url_el.get("href", "") if company_url_el else ""
+
+    location       = sel_text(".topcard__flavor--bullet",
+                               ".job-details-jobs-unified-top-card__bullet")
+    workplace_type = get_workplace_type(soup)
+
+    time_el    = soup.find("time")
+    raw_posted = (time_el.get("datetime", "") if time_el else "") or \
+                 sel_text(".posted-time-ago__text",
+                          ".job-details-jobs-unified-top-card__posted-date")
+    posted_date = resolve_posted_date(raw_posted)
+
+    raw_desc    = sel_text(".show-more-less-html__markup", ".description__text")
+    description = clean_description(raw_desc)
+
+    # v7: detect language of the description so we know whether to run the
+    # English-oriented paraphrase prompts.
+    desc_lang = detect_text_language(description)
+
+    salary = ""
+    for s in [".compensation__salary",".salary","[class*='salary']","[class*='compensation']"]:
+        el = soup.select_one(s)
+        if el: salary = el.get_text(strip=True); break
+    if not salary:
+        for chip in soup.select(".job-details-jobs-unified-top-card__job-insight"):
+            t = chip.get_text(strip=True)
+            if re.search(r"\$|MUR|Rs\.?|SAR|salary|/yr|/hour|per month", t, re.I):
+                salary = t; break
+
+    raw_job_type      = get_job_criteria(soup, "Employment type") or workplace_type
+    job_type          = raw_job_type or "Full-time"
+    linkedin_function = get_job_criteria(soup, "Job function")
+    linkedin_industry = get_job_criteria(soup, "Industries")
+
+    real_deadline      = parse_deadline(soup)
+    estimated_deadline = estimate_deadline_from_posted(posted_date) if not real_deadline else ""
+    effective_deadline = real_deadline or estimated_deadline
+
+    # ── LAYER 1: job-page extraction ─────────────────────────────────────────
+    job_page_co = extract_company_from_job_page(html, soup)
+    ld          = _parse_jsonld(html)
+
+    # ── LAYER 2: LinkedIn company page ───────────────────────────────────────
+    time.sleep(0.5)
+    company = scrape_company_details(company_url_raw)
+
+    # ── LAYER 3: merge ────────────────────────────────────────────────────────
+    def _first(*vals) -> str:
+        for v in vals:
+            if v and str(v).strip(): return str(v).strip()
+        return ""
+
+    # v7: filter out LinkedIn login-wall placeholders ("Sign in", favicon logo)
+    # before merging, so they never win the _first() priority chain.
+    company_name_li = company.get("name", "")
+    if is_bad_company_name(company_name_li):
+        company_name_li = ""
+
+    company_logo_li = company.get("logo", "")
+    if is_placeholder_logo(company_logo_li):
+        company_logo_li = ""
+
+    company_name_jobpage = job_page_co.get("company_name", "")
+    if is_bad_company_name(company_name_jobpage):
+        company_name_jobpage = ""
+
+    if is_bad_company_name(company_name_fallback):
+        company_name_fallback = ""
+
+    merged_name = _first(
+        company_name_li,
+        company_name_jobpage,
+        company_name_fallback,
+        extract_company_from_job_url(job_url),
+    )
+    merged_industry = _first(company.get("industry"), job_page_co.get("company_industry"), linkedin_industry)
+    merged_logo_li  = _first(company_logo_li, job_page_co.get("company_logo"))   # raw LinkedIn logo
+    merged_website  = _first(company.get("website"),  job_page_co.get("company_website"))
+    merged_hq       = _first(company.get("headquarters"), job_page_co.get("company_address"))
+    merged_founded  = _first(company.get("founded"),  job_page_co.get("company_founded"))
+    merged_type     = _first(company.get("type"))
+    merged_about    = _first(company.get("about"),    job_page_co.get("company_about"))
+    company_url_out = _first(company.get("company_url"), company_url_raw)  # LinkedIn company URL, kept as-is
+
+    # Ensure merged_website is not a LinkedIn URL
+    merged_website = blank_if_linkedin(merged_website)
+
+    # ── LAYER 4: deep company website crawl (apply + enrichment) ────────────
+    site_info: dict = {}
+    deep_enrich: dict = {}
+
+    job_field = linkedin_function or merged_industry or infer_job_field(title, description)
+
+    # ── LAYER 5: application details (v6 deep crawl + all fallbacks) ─────────
+    time.sleep(0.2)
+    apply_data = extract_application_details(
+        job_url, soup, merged_website, ld,
+        job_title=title,
+        site_info=site_info,   # populated below if deep crawl wasn't already done
+    )
+    deep_enrich = apply_data.get("_deep") or {}
+
+    # If the deep crawl above didn't happen (e.g. no website at all) but we
+    # do have a website, run the standalone about/contact/footer scraper so
+    # we still try to fill missing company fields + logo.
+    if not deep_enrich and merged_website and not should_skip_crawl(merged_website):
+        log.info(f"v6 about/contact/footer crawl (standalone): {merged_website}")
+        deep_enrich = scrape_about_contact_footer(merged_website)
+
+    # Use deep_enrich to fill in missing company fields
+    if deep_enrich:
+        if not merged_hq      and deep_enrich.get("address"):
+            merged_hq = deep_enrich["address"]
+        if not merged_founded and deep_enrich.get("founded"):
+            merged_founded = deep_enrich["founded"]
+        if not merged_about   and (deep_enrich.get("about") or deep_enrich.get("description")):
+            merged_about = deep_enrich.get("about") or deep_enrich.get("description")
+        if not merged_industry and deep_enrich.get("industry"):
+            merged_industry = deep_enrich["industry"]
+
+        phone = deep_enrich.get("phone")
+        if phone:
+            phone_note = f"Phone: {phone}"
+            if phone_note not in (merged_about or ""):
+                merged_about = (merged_about + "\n" + phone_note).strip() if merged_about else phone_note
+
+    # If we still don't have a usable company name (e.g. LinkedIn page was a
+    # login wall AND the job page had nothing), try the website domain itself.
+    if is_bad_company_name(merged_name) and merged_website:
+        try:
+            netloc = urlparse(merged_website).netloc
+            netloc = re.sub(r"^www\.", "", netloc)
+            base   = netloc.split(".")[0]
+            if base:
+                merged_name = base.replace("-", " ").title()
+        except Exception:
+            pass
+
+    # ── LOGO: prefer company website logo over LinkedIn's (which is often
+    #          missing or a generic placeholder) ─────────────────────────────
+    company_site_logo = (deep_enrich.get("logo") if deep_enrich else "") or ""
+    if not company_site_logo and merged_website and not should_skip_crawl(merged_website):
+        company_site_logo = get_company_website_logo(merged_website)
+
+    if company_site_logo and not is_placeholder_logo(company_site_logo):
+        merged_logo = company_site_logo
+        logo_source = "company_website"
+    elif merged_logo_li and not is_placeholder_logo(merged_logo_li):
+        merged_logo = merged_logo_li
+        logo_source = "linkedin"
+    else:
+        merged_logo = company_site_logo or merged_logo_li or ""
+        logo_source = "fallback"
+
+    raw_apply = ""
+    if apply_data.get("email"):
+        raw_apply = clean_email(apply_data["email"])
+    elif apply_data.get("url") and apply_data.get("method") != "not_found":
+        raw_apply = apply_data["url"]
+    apply_link = clean_application_link(raw_apply)
+
+    # Final safety net — blank any remaining LinkedIn URLs in apply/website
+    apply_link     = blank_if_linkedin(apply_link)
+    merged_website = blank_if_linkedin(merged_website)
+    # Company URL (LinkedIn company page) is intentionally NOT blanked
+
+    qualifications = extract_qualification(description)
+    experience     = extract_experience(description)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  ▶▶ PARAPHRASE
+    # ─────────────────────────────────────────────────────────────────────────
+    mark_scraped(job_id, job_url, title, merged_name)
+    processed_ids.add(job_id)
+    processed_urls.add(job_url)
+
+    paraphrased_title = title
+    paraphrased_desc  = description
+    paraphrased_about = merged_about
+
+    # v7: skip the English-oriented paraphrase prompts for predominantly
+    # Arabic descriptions — they're kept as-is (now correctly preserved by
+    # sanitize_text) and flagged via _lang for manual review/translation.
+    if ENABLE_PARAPHRASE and MISTRAL_API_KEY and desc_lang != "ar":
+        print(C_BLUE(f"\n  ✍️  Paraphrasing '{title}' ..."))
+        paraphrased_title = paraphrase_title(title)
+        paraphrased_desc  = paraphrase_description(description)
+        if merged_about:
+            paraphrased_about = paraphrase_company(merged_about)
+        mark_paraphrased(job_id)
+    elif desc_lang == "ar":
+        print(C_DIM("  ⚠️  Paraphrasing skipped (description detected as Arabic)"))
+    else:
+        print(C_DIM("  ⚠️  Paraphrasing skipped (ENABLE_PARAPHRASE=False or MISTRAL_API_KEY not set)"))
+
+    return {
+        # Paraphrased fields
+        "jobTitle":          paraphrased_title,
+        "jobDescription":    paraphrased_desc,
+        "companyDetails":    paraphrased_about,
+        # Original fields (for audit / duplicate detection)
+        "originalTitle":     title,
+        "originalDesc":      description,
+        # Structured fields — match standardized column order
+        "jobType":           job_type,
+        "jobQualifications": qualifications,
+        "jobExperience":     experience,
+        "jobLocation":       location,
+        "jobField":          job_field,
+        "datePosted":        posted_date,
+        "deadline":          effective_deadline,
+        "application":       apply_link,          # LinkedIn URLs already blanked
+        "companyUrl":        company_url_out,      # LinkedIn company page URL — KEPT
+        "companyName":       merged_name,
+        "companyLogo":       clean_logo_url(merged_logo),
+        "companyIndustry":   merged_industry,
+        "companyFounded":    merged_founded,
+        "companyType":       merged_type,
+        "companyWebsite":    merged_website,       # LinkedIn URLs already blanked
+        "companyAddress":    merged_hq,
+        "jobUrl":            job_url,
+        "estimatedDeadline": estimated_deadline,
+        "salaryRange":       salary,
+        "_jobId":            job_id,
+        "_apply_method":     apply_data.get("method", ""),
+        "_logo_source":      logo_source,
+        "_lang":             desc_lang,
+    }
 
 # =============================================================================
 #  WORDPRESS POSTING
@@ -1277,9 +2795,8 @@ def _wp_auth_headers() -> dict:
     token = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
     return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
 
-def get_or_create_term(taxonomy_url: str, name: str):
-    if not name or not name.strip():
-        return None
+def get_or_create_term(taxonomy_url: str, name: str) -> int | None:
+    if not name or not name.strip(): return None
     slug = re.sub(r"[^a-z0-9-]", "-", name.lower().strip())
     h = _wp_auth_headers()
     try:
@@ -1294,12 +2811,12 @@ def get_or_create_term(taxonomy_url: str, name: str):
                           headers=h, auth=(WP_USER, WP_PASSWORD), timeout=10, verify=False)
         return r.json().get("id")
     except Exception as e:
-        log_.error(f"Term create error '{name}': {e}")
+        log.error(f"Term create error '{name}': {e}")
         return None
 
 def post_job_to_wordpress(job: dict) -> tuple:
     if not WP_USER or not WP_PASSWORD:
-        log_.warning("WP_USERNAME / WP_APP_PASSWORD not set — skipping WordPress post")
+        log.warning("WP_USERNAME / WP_APP_PASSWORD not set — skipping WordPress post")
         return None, None
 
     h = _wp_auth_headers()
@@ -1314,26 +2831,37 @@ def post_job_to_wordpress(job: dict) -> tuple:
         r = requests.get(f"{WP_JOBS_URL}?slug={slug}", headers=h, timeout=10, verify=False)
         posts = r.json()
         if isinstance(posts, list) and posts:
-            log_.info(f"Job already on WP: {title}")
+            log.info(f"⏭ Job already on WP: {title}")
             return posts[0]["id"], posts[0].get("link")
     except Exception:
         pass
 
+    # All URL fields already have LinkedIn blanked at scrape time
+    # (Company URL is the LinkedIn company page and IS sent — it's a
+    #  user-facing LinkedIn profile link, not an apply/application link)
     logo_url    = sanitize_text(job.get("companyLogo", ""), is_url=True)
     location    = sanitize_text(job.get("jobLocation", ""))
-    raw_type    = sanitize_text(job.get("jobType", "")) or "Full-time"
-    job_type_s  = map_job_type(raw_type)
+    raw_type    = sanitize_text(job.get("jobType", "Full-time"))
+    job_type_s  = JOB_TYPE_MAPPING.get(raw_type.lower().strip(), "full-time")
     company     = sanitize_text(job.get("companyName", ""))
     application = sanitize_text(job.get("application", ""), is_url=True)
     company_url = sanitize_text(job.get("companyUrl", ""), is_url=True)
-    deadline    = sanitize_text(job.get("deadline", ""))
+    deadline    = sanitize_text(job.get("deadline", "")) or sanitize_text(job.get("estimatedDeadline", ""))
     co_website  = sanitize_text(job.get("companyWebsite", ""), is_url=True)
     qualif      = sanitize_text(job.get("jobQualifications", ""))
     experience  = sanitize_text(job.get("jobExperience", ""))
+    industry    = sanitize_text(job.get("companyIndustry", ""))
     co_address  = sanitize_text(job.get("companyAddress", ""))
     job_field   = sanitize_text(job.get("jobField", ""))
+    co_founded  = sanitize_text(job.get("companyFounded", ""))
+    co_type     = sanitize_text(job.get("companyType", ""))
     salary      = sanitize_text(job.get("salaryRange", ""))
     about       = sanitize_text(job.get("companyDetails", ""))
+
+    # Extra safety check before posting (application + website only —
+    # companyUrl is intentionally allowed to be a LinkedIn URL)
+    application = blank_if_linkedin(application)
+    co_website  = blank_if_linkedin(co_website)
 
     is_email = bool(re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", application))
     is_url_v = bool(re.match(r"^https?://[^\s]+$", application))
@@ -1344,7 +2872,8 @@ def post_job_to_wordpress(job: dict) -> tuple:
     attachment_id = None
     if logo_url:
         try:
-            img_r = requests.get(logo_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=15)
+            img_r = requests.get(logo_url, headers={"User-Agent": HEADERS["User-Agent"],
+                                                      "Referer": "https://www.linkedin.com/"}, timeout=15)
             if img_r.status_code == 200:
                 ct  = img_r.headers.get("Content-Type", "image/jpeg")
                 ext = "png" if "png" in ct else "jpg"
@@ -1357,11 +2886,13 @@ def post_job_to_wordpress(job: dict) -> tuple:
                 if up_r.status_code in (200, 201):
                     attachment_id = up_r.json().get("id")
         except Exception as e:
-            log_.warning(f"Logo upload failed: {e}")
+            log.warning(f"Logo upload failed: {e}")
 
     region_term_id   = get_or_create_term(f"{WP_BASE}/job_listing_region", location)
     job_type_term_id = get_or_create_term(f"{WP_BASE}/job_listing_type",
                                            job_type_s.replace("-", " ").title())
+
+    tagline = paraphrase_tagline(about[:300]) if about else ""
 
     payload = {
         "title":          title,
@@ -1379,7 +2910,11 @@ def post_job_to_wordpress(job: dict) -> tuple:
             "_company_name":       company,
             "_company_website":    co_website,
             "_company_logo":       str(attachment_id) if attachment_id else "",
+            "_company_industry":   industry,
             "_company_address":    co_address,
+            "_company_founded":    co_founded,
+            "_company_type":       co_type,
+            "_company_tagline":    tagline,
             "_company_details":    about,
             "_job_qualifications": qualif,
             "_job_experiences":    experience,
@@ -1396,697 +2931,335 @@ def post_job_to_wordpress(job: dict) -> tuple:
                               auth=(WP_USER, WP_PASSWORD), timeout=20, verify=False)
             r.raise_for_status()
             post = r.json()
-            log_.info(f"Job posted: '{title}' -> WP ID {post.get('id')}")
+            log.info(f"✅ Job posted: '{title}' → WP ID {post.get('id')}")
             return post.get("id"), post.get("link")
         except Exception as e:
-            log_.error(f"Job post attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
+            log.error(f"Job post attempt {attempt+1} failed: {e}")
+            if attempt < 2: time.sleep(2 ** attempt)
     return None, None
-
-# =============================================================================
-#  STEP 1 — COLLECT JOB DETAIL URLS FROM THE LIBYANJOBS ARCHIVE (paginated)
-# =============================================================================
-
-def _strip_locale(segs: list) -> list:
-    """Drop a leading 2-letter locale segment (e.g. ['en','jobs','x'] -> ['jobs','x'])."""
-    if segs and len(segs[0]) == 2 and segs[0].isalpha() and segs[0] != "jobs":
-        return segs[1:]
-    return segs
-
-def _norm_job_url(href: str) -> str:
-    """Canonicalise a /jobs/<slug>/ URL: https host (no www), no /en/ locale,
-    no query/fragment, trailing slash — so /en/jobs/x/ and /jobs/x/ dedupe."""
-    if not href:
-        return ""
-    absu = urljoin(BASE_URL + "/", href)
-    p = urlsplit(absu)
-    segs = _strip_locale([s for s in p.path.split("/") if s])
-    path = "/" + "/".join(segs)
-    if not path.endswith("/"):
-        path += "/"
-    netloc = p.netloc.lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
-    return urlunsplit(("https", netloc, path, "", ""))
-
-def _is_job_detail_path(path: str) -> bool:
-    """True for /jobs/<slug>/ exactly (one segment after 'jobs', not 'page'),
-    tolerating an optional leading locale prefix like /en/."""
-    parts = _strip_locale([s for s in path.split("/") if s])
-    return len(parts) == 2 and parts[0] == "jobs" and parts[1].lower() != "page"
-
-def _page_url(jobs_url: str, page: int) -> str:
-    if page <= 1:
-        return jobs_url
-    base = jobs_url if jobs_url.endswith("/") else jobs_url + "/"
-    return f"{base}page/{page}/"
-
-def collect_job_links(jobs_url: str, max_pages: int = MAX_PAGES) -> list:
-    """Walk the archive pages and return ordered, de-duplicated detail URLs."""
-    print(C_BLUE(f"\n  Collecting job links from: {jobs_url}"))
-    seen, ordered = set(), []
-    empty_streak = 0
-
-    for page in range(1, max_pages + 1):
-        url = _page_url(jobs_url, page)
-        try:
-            soup = get_soup(url)
-        except requests.HTTPError as e:
-            log(C_DIM(f"  Page {page}: HTTP {getattr(e.response,'status_code','?')} — stopping."))
-            break
-        except Exception as e:
-            log(C_DIM(f"  Page {page}: fetch error ({e}) — stopping."))
-            break
-
-        page_new = 0
-        for a in soup.find_all("a", href=True):
-            p = urlparse(a["href"])
-            path = p.path or urlparse(urljoin(BASE_URL + "/", a["href"])).path
-            if not _is_job_detail_path(path):
-                continue
-            norm = _norm_job_url(a["href"])
-            if norm and norm not in seen:
-                seen.add(norm)
-                ordered.append(norm)
-                page_new += 1
-
-        log(f"    Page {page}: {page_new} new job link(s) (total {len(ordered)})")
-
-        if page_new == 0:
-            empty_streak += 1
-            if empty_streak >= 2:
-                break
-        else:
-            empty_streak = 0
-
-        time.sleep(REQUEST_DELAY)
-
-    return ordered
-
-# =============================================================================
-#  STEP 2 — PARSE ONE LIBYANJOBS DETAIL PAGE
-# =============================================================================
-
-# Order matters: the FIRST highly-specific selectors target JobMonster's real
-# job body (`<div class="map-style-2" itemprop="description">`). Only if those
-# miss do we fall back to generic WP content containers — and the <body> fallback
-# is gated behind a "looks like a real post body" check below.
-_CONTENT_SELECTORS = [
-    'div.map-style-2[itemprop="description"]',   # JobMonster job body (exact)
-    'div[itemprop="description"]',               # JobMonster job body (generic)
-    "div.map-style-2",
-    "div.single-job-content", "div.job-description", "div.single-job-description",
-    "div.noo-job-content", "div.job-content", "div.job_description",
-    "article .entry-content", "div.entry-content", "main .entry-content",
-    "div.page-content",
-]
-
-def _find_content(soup):
-    """Return the element most likely to hold the job post body."""
-    best, best_len = None, 0
-    for sel in _CONTENT_SELECTORS:
-        el = soup.select_one(sel)
-        if el:
-            txt = el.get_text(" ", strip=True)
-            if len(txt) > best_len:
-                best, best_len = el, len(txt)
-        if best and best_len > 300:
-            return best
-    if best:
-        return best
-    # Last resort: a single related-job <article> or <main> — deliberately NOT
-    # the whole <body> (which would drag in topbar/footer chrome and make the
-    # site's own elmansori@libyanjobs.ly look like an apply address).
-    main = soup.select_one("div.noo-main") or soup.find("main")
-    if main:
-        return main
-    return soup.find("article") or soup.body or soup
-
-def _anchors_in(scope, needle):
-    out = []
-    for a in scope.find_all("a", href=True):
-        if needle in (urlparse(a["href"]).path or a["href"]):
-            t = a.get_text(" ", strip=True)
-            if t:
-                out.append(t)
-    return out
-
-def _is_real_apply_url(href: str) -> bool:
-    if not href:
-        return False
-    low = href.lower()
-    if low.startswith("mailto:") or low.startswith("#") or low.startswith("javascript:"):
-        return False
-    if not low.startswith("http"):
-        return False
-    if any(s in low for s in _NON_APPLY_HOST_SUBSTR):
-        return False
-    if any(s in low for s in _NON_APPLY_PATH_SUBSTR):
-        return False
-    return True
-
-def _is_apply_heading_line(line: str) -> bool:
-    """
-    True only for a SHORT standalone line that introduces application instructions,
-    e.g. 'How to Apply', 'Mode of Application', 'Application Procedure',
-    'كيفية التقديم'. The length guard stops it matching a mid-sentence 'to apply'.
-    """
-    s = line.strip().lstrip("•*-–—#:. ").strip()
-    if not s:
-        return False
-    if any(s.startswith(a) or a in s for a in _APPLY_HEAD_AR) and len(s) <= 40:
-        return True
-    if len(s.split()) > 9:
-        return False
-    return bool(_APPLY_HEAD_PHRASES.match(s))
-
-def _split_description_and_apply(content_text: str):
-    """
-    Drop trailing boilerplate / UI lines and split off the 'How to Apply' tail.
-    Returns (description, apply_text). The apply tail (apply email/URL + deadline
-    sentence) is removed from the description so the posted body is just content.
-    """
-    if not content_text:
-        return "", ""
-
-    lines = content_text.split("\n")
-    kept = []
-    for ln in lines:
-        low = ln.strip().lower()
-        if low in _BODY_DROP_LINES:
-            continue
-        if any(low.startswith(m) for m in _BODY_CUT_MARKERS):
-            break
-        kept.append(ln)
-
-    apply_idx = None
-    for i, ln in enumerate(kept):
-        if _is_apply_heading_line(ln):
-            apply_idx = i
-            break
-
-    if apply_idx is None:
-        return "\n".join(kept).strip(), ""
-
-    description = "\n".join(kept[:apply_idx]).strip()
-    apply_text  = "\n".join(kept[apply_idx:]).strip()
-    if not description:
-        return "\n".join(kept).strip(), ""
-    return description, apply_text
-
-def scrape_job_detail(url: str) -> dict:
-    """Parse a single LibyanJobs /jobs/<slug>/ page into a raw_job dict."""
-    soup = get_soup(url)
-
-    # --- Title --------------------------------------------------------------
-    h1 = (soup.select_one("h1.page-title") or soup.select_one("h1.job-title")
-          or soup.select_one("h1.entry-title") or soup.find("h1"))
-    title = clean_title(h1.get_text(" ", strip=True) if h1 else "")
-
-    # --- Logo (og:image is the employer logo on this theme) -----------------
-    logo = ""
-    og = soup.find("meta", attrs={"property": "og:image"}) or \
-         soup.find("meta", attrs={"name": "og:image"})
-    if og and og.get("content"):
-        logo = og["content"].strip()
-    if not logo:
-        emp_img = soup.select_one('a[href*="/companies/"] img, a[href*="/company/"] img')
-        if emp_img and emp_img.get("src"):
-            logo = emp_img["src"].strip()
-
-    # --- Employer / company (/companies/ on this site) ----------------------
-    company_name = ""
-    company_url  = ""
-    emp_a = soup.select_one('a[href*="/companies/"]') or soup.select_one('a[href*="/company/"]')
-    if emp_a:
-        company_name = emp_a.get_text(" ", strip=True)
-        company_url  = urljoin(BASE_URL + "/", emp_a["href"])
-    if not company_name:
-        company_name = "LibyanJobs Employer"
-
-    # Company's own website (sidebar, title="Website") + address.
-    company_website = ""
-    site_a = soup.find("a", attrs={"title": "Website"})
-    if site_a and site_a.get("href") and site_a["href"].startswith("http") \
-            and "libyanjobs.ly" not in site_a["href"].lower():
-        company_website = site_a["href"].strip()
-
-    company_address = ""
-    full_addr_label = soup.find(string=re.compile(r"Full Address", re.I))
-    if full_addr_label:
-        parent = getattr(full_addr_label, "parent", None)
-        if parent:
-            txt = parent.get_text(" ", strip=True)
-            company_address = re.sub(r".*Full Address[:\s]*", "", txt, flags=re.I).strip()
-
-    # --- Meta taxonomies ----------------------------------------------------
-    job_type_opts  = _anchors_in(soup, "/job-type/")
-    location_opts  = _anchors_in(soup, "/job-location/")
-    category_opts  = _anchors_in(soup, "/job-category/")
-
-    job_type = map_job_type(job_type_opts[0]) if job_type_opts else "full-time"
-    location = pick_location(location_opts)
-    # Site's own multi-category tags (Latin-cleaned, kept as infer_field fallback).
-    cats_clean = []
-    for c in category_opts:
-        cc = _clean_bilingual(c)
-        if cc and cc not in cats_clean:
-            cats_clean.append(cc)
-    job_field_raw = ", ".join(cats_clean)
-
-    # --- Dates (ISO on cards; ISO range = posted - closing) -----------------
-    date_posted = ""
-    deadline    = ""
-
-    meta_text = ""
-    type_a = soup.select_one('a[href*="/job-type/"]') or \
-             soup.select_one('a[href*="/job-location/"]')
-    if type_a:
-        node = type_a
-        for _ in range(4):
-            node = node.parent
-            if node is None:
-                break
-            txt = node.get_text(" ", strip=True)
-            if ISO_DATE_RE.search(txt) or MDY_DATE_RE.search(txt):
-                meta_text = txt
-                break
-    meta_ds = iso_dates(meta_text) or mdy_dates(meta_text) or dmy_dates(meta_text)
-    if len(meta_ds) >= 2:
-        date_posted, deadline = meta_ds[0], meta_ds[-1]
-    elif len(meta_ds) == 1:
-        date_posted = meta_ds[0]   # single card date = posted date on JobMonster
-
-    # Explicit deadline label anywhere on the page wins if present.
-    page_text_full = soup.get_text("\n")
-    for lab in DEADLINE_LABELS:
-        m = re.search(rf"{re.escape(lab)}\s*[:\-]?\s*([^\n<]{{0,40}})", page_text_full, re.I)
-        if m:
-            d = parse_any_date(m.group(1))
-            if d:
-                deadline = d
-                break
-    # "before / by / no later than <date>" near an application cue.
-    if not deadline:
-        for m in re.finditer(
-                r"(?:before|by|not\s+later\s+than|no\s+later\s+than)\s+([^\n<.,;]{0,40})",
-                page_text_full, re.I):
-            d = parse_any_date(m.group(1))
-            if d:
-                deadline = d
-                break
-    if not date_posted:
-        date_posted = datetime.now().strftime("%Y-%m-%d")
-    if not deadline:
-        deadline = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-
-    # --- Body: description + how-to-apply -----------------------------------
-    content_el = _find_content(soup)
-    content_copy = BeautifulSoup(str(content_el), "lxml")
-    content_text = html_block_to_text(content_copy)
-    description, apply_text = _split_description_and_apply(content_text)
-    if not description:
-        description = content_text
-
-    # --- Qualification + experience (normalised to schema tier/band) --------
-    qual_block = ""
-    qm = re.search(
-        r"(?:^|\n)[ \t]*qualifications?(?:\s*(?:&|and)\s*experience)?(?:\s+\w+){0,3}\s*:?[ \t]*\n"
-        r"(.*?)"
-        r"(?:\n[ \t]*(?:how\s*(?:and|&)?\s*(?:deadline\s*)?to\s*apply|what\s+we\s+offer|"
-        r"key\s+competenc|duration\s+of|method\s+of\s+application|mode\s+of\s+application)\b"
-        r"|\n[ \t]*[A-Z][^\n]{0,60}:[ \t]*\n|\Z)",
-        description, re.I | re.S)
-    if qm:
-        qual_block = qm.group(1).strip()[:1500]
-    qualification = extract_qualification(qual_block or description)
-    experience    = extract_experience_band(qual_block or description)
-
-    # --- Job field (single canonical field, site category as fallback) ------
-    job_field = infer_field(title, description, job_field_raw)
-
-    # --- Apply target (email or external URL) -------------------------------
-    apply_email = ""
-    apply_url   = ""
-
-    # 1) anchors within the content body
-    for a in content_el.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.lower().startswith("mailto:"):
-            cand = extract_email(href[7:])
-            if cand and _is_real_apply_email(cand):
-                apply_email = apply_email or cand
-        elif _is_real_apply_url(href):
-            apply_url = apply_url or strip_tracking_params(href)
-
-    # 2) plain-text fallbacks from the apply tail (or whole body)
-    scan = apply_text or description
-    if not apply_email:
-        cand = extract_email(scan)
-        if cand and _is_real_apply_email(cand):
-            apply_email = cand
-    if not apply_url:
-        for u in URL_PATTERN.findall(scan):
-            if _is_real_apply_url(u):
-                apply_url = strip_tracking_params(u.rstrip(".,);"))
-                break
-
-    salary = extract_salary(description)
-
-    # If location is still the country catch-all, try to lift one from the body.
-    if location in ("Libya", DEFAULT_LOCATION):
-        loc_from_body = location_from_text(description)
-        if loc_from_body not in ("Libya", DEFAULT_LOCATION):
-            location = loc_from_body
-
-    return {
-        "title":          title,
-        "company_name":   company_name,
-        "company_url":    company_url,
-        "company_website":company_website,
-        "company_address":company_address,
-        "company_logo":   logo,
-        "job_type":       job_type,
-        "location":       location,
-        "job_field":      job_field,
-        "job_categories": job_field_raw,
-        "date_posted":    date_posted,
-        "deadline":       deadline,
-        "description":    description,
-        "qualification":  qualification,
-        "experience":     experience,
-        "salary":         salary,
-        "apply_email":    apply_email,
-        "apply_url":      apply_url,
-        "apply_text":     apply_text,
-        "job_url":        _norm_job_url(url),
-    }
-
-# =============================================================================
-#  STEP 3 — DEDUPLICATE + PARAPHRASE + APPLY-RULE GATING
-# =============================================================================
-
-def process_job(raw_job: dict, processed_ids: set, processed_urls: set, seen_content: set):
-    """
-    Returns (status, job_dict_or_None):
-        ("duplicate", None) — already processed / seen this run
-        ("flagged",   None) — failed public-apply rule, written to flagged CSV
-        ("ok",        dict) — ready to post to WordPress
-    """
-    job_url  = raw_job.get("job_url", "")
-    title    = raw_job.get("title", "")
-    company  = raw_job.get("company_name", "")
-    location = raw_job.get("location", "")
-
-    if not title:
-        return "duplicate", None
-
-    job_id = make_job_id(job_url, title, company)
-
-    if job_id in processed_ids or job_url in processed_urls:
-        log(C_DIM(f"  Already processed (tracker) — skipped: {title}"))
-        return "duplicate", None
-
-    fingerprint = (title.lower().strip(), company.lower().strip(), location.lower().strip())
-    if fingerprint in seen_content:
-        log(C_DIM(f"  Duplicate content this run — skipped: {title}"))
-        return "duplicate", None
-    seen_content.add(fingerprint)
-
-    # ---- Public-apply rule -------------------------------------------------
-    apply_email = raw_job.get("apply_email", "")
-    apply_url   = raw_job.get("apply_url", "")
-    qualifies   = bool(apply_email) or bool(apply_url)
-
-    if REQUIRE_PUBLIC_APPLY and not qualifies:
-        write_flagged(raw_job,
-                      "no public apply email or external URL (login-only on LibyanJobs)",
-                      raw_job.get("apply_text", "")[:300])
-        log(C_RED(f"  FLAGGED (no public apply) — {title}"))
-        return "flagged", None
-
-    mark_scraped(job_id, job_url, title, company)
-    processed_ids.add(job_id)
-    processed_urls.add(job_url)
-
-    description = raw_job.get("description", "")
-    paraphrased_title = title
-    paraphrased_desc  = description
-
-    if ENABLE_PARAPHRASE and MISTRAL_API_KEY:
-        print(C_BLUE(f"\n  Paraphrasing '{title}' ..."))
-        paraphrased_title = paraphrase_title(title)
-        paraphrased_desc  = paraphrase_description(description)
-        mark_paraphrased(job_id)
-    else:
-        print(C_DIM("  Paraphrasing skipped (ENABLE_PARAPHRASE=False or MISTRAL_API_KEY not set)"))
-
-    application = apply_email or apply_url
-    apply_method = ("description_email" if apply_email
-                    else "external_url" if apply_url else "not_found")
-
-    company_link = raw_job.get("company_website") or raw_job.get("company_url", "")
-
-    return "ok", {
-        "jobTitle":          paraphrased_title,
-        "jobDescription":    paraphrased_desc,
-        "companyDetails":    "",
-        "originalTitle":     title,
-        "originalDesc":      description,
-        "jobType":           raw_job.get("job_type", "full-time"),
-        "jobQualifications": raw_job.get("qualification", ""),
-        "jobExperience":     raw_job.get("experience", ""),
-        "jobLocation":       location,
-        "jobField":          raw_job.get("job_field", ""),
-        "datePosted":        raw_job.get("date_posted", datetime.now().strftime("%Y-%m-%d")),
-        "deadline":          raw_job.get("deadline", ""),
-        "application":       application,
-        "companyUrl":        company_link,
-        "companyName":       company,
-        "companyLogo":       raw_job.get("company_logo", ""),
-        "companyWebsite":    raw_job.get("company_website", ""),
-        "companyAddress":    raw_job.get("company_address", "") or location,
-        "jobUrl":            job_url,
-        "salaryRange":       raw_job.get("salary", ""),
-        "_jobId":            job_id,
-        "_apply_method":     apply_method,
-        "_apply_raw":        raw_job.get("apply_text", "")[:160],
-    }
 
 # =============================================================================
 #  VERBOSE PRINTER
 # =============================================================================
 
-def print_job_verbose(index, job):
-    desc = job.get("jobDescription", "")
+def print_job_verbose(job: dict, index: int, total: int):
+    desc         = job.get("jobDescription", "")
     desc_preview = (desc[:400] + " [...]") if len(desc) > 400 else desc
-
+    desc_indented = "\n".join("   " + line for line in desc_preview.splitlines() if line.strip())
+    apply        = job.get("application", "")
+    logo         = job.get("companyLogo", "")
+    logo_source  = job.get("_logo_source", "")
+    orig_title   = job.get("originalTitle", "")
+    method       = job.get("_apply_method", "")
+    lang         = job.get("_lang", "")
     print()
     print(C_DIVIDER())
-    print(C_HEADER(f"  JOB #{index}"))
+    print(C_HEADER(f"  JOB {index}/{total}"))
     print(C_DIVIDER())
-    print(f"  {C_LABEL('Title (original)')}    : {C_VALUE(job.get('originalTitle',''))}")
-    print(f"  {C_LABEL('Title (paraphrased)')} : {C_GREEN(job.get('jobTitle',''))}")
-    print(f"  {C_LABEL('Job Type')}             : {job.get('jobType','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Qualification')}        : {(job.get('jobQualifications','')[:120] or C_DIM('—'))}")
-    print(f"  {C_LABEL('Experience')}           : {job.get('jobExperience','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Location')}             : {job.get('jobLocation','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Category/Field')}       : {job.get('jobField','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Salary')}               : {job.get('salaryRange','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Posted')}               : {job.get('datePosted','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Deadline')}             : {job.get('deadline','') or C_DIM('—')}")
-
-    application = job.get("application", "")
-    print(f"  {C_LABEL('Apply')}                : {C_GREEN(application) if application else C_DIM('— not found —')}")
-    print(f"  {C_LABEL('Apply Method')}         : {C_DIM(job.get('_apply_method',''))}")
-
+    print(f"  {C_LABEL('Title (original)')}   : {C_VALUE(orig_title)}")
+    print(f"  {C_LABEL('Title (paraphrased)')}: {C_GREEN(job.get('jobTitle',''))}")
+    print(f"  {C_LABEL('Language')}           : {lang or C_DIM('—')}")
+    print(f"  {C_LABEL('Job Type')}            : {job.get('jobType','')}")
+    print(f"  {C_LABEL('Field')}               : {job.get('jobField','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Location')}            : {job.get('jobLocation','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Seniority')}           : {job.get('jobExperience','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Qualifications')}      : {job.get('jobQualifications','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Salary')}              : {job.get('salaryRange','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Date Posted')}         : {job.get('datePosted','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Deadline')}            : {job.get('deadline','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Apply Link')}          : {C_GREEN(apply) if apply else C_DIM('— not found / blanked —')}")
+    print(f"  {C_LABEL('Apply Method')}        : {C_DIM(method) if method else C_DIM('—')}")
     print()
-    print(f"  {C_BLUE('── EMPLOYER ─────────────────────────────────────────')}")
-    print(f"  {C_LABEL('Name')}      : {C_VALUE(job.get('companyName','') or C_DIM('—'))}")
-    print(f"  {C_LABEL('Website')}   : {job.get('companyWebsite','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Source')}    : {job.get('companyUrl','') or C_DIM('—')}")
-    print(f"  {C_LABEL('Logo')}      : {job.get('companyLogo','') or C_DIM('— none —')}")
-
+    print(f"  {C_BLUE('── COMPANY ──────────────────────────────────────────────')}")
+    print(f"  {C_LABEL('Name')}           : {C_VALUE(job.get('companyName','') or C_DIM('—'))}")
+    print(f"  {C_LABEL('Industry')}       : {job.get('companyIndustry','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Type')}           : {job.get('companyType','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Founded')}        : {job.get('companyFounded','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Headquarters')}   : {job.get('companyAddress','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Website')}        : {job.get('companyWebsite','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Company URL')}    : {job.get('companyUrl','') or C_DIM('—')}")
+    print(f"  {C_LABEL('Logo')}           : {logo if logo else C_DIM('— none —')}"
+          + (f"  {C_DIM('(' + logo_source + ')')}" if logo else ""))
+    about = job.get("companyDetails", "")
+    if about:
+        preview = (about[:200] + " [...]") if len(about) > 200 else about
+        print(f"  {C_LABEL('About')}          : {preview}")
     print()
-    print(f"  {C_BLUE('── DESCRIPTION PREVIEW ─────────────────────────────')}")
-    print(desc_preview if desc_preview else C_DIM("   — no description —"))
-    print(f"  {C_LABEL('Job URL')}   : {job.get('jobUrl','')}")
+    print(f"  {C_BLUE('── DESCRIPTION PREVIEW ─────────────────────────────────')}")
+    print(desc_indented if desc_indented else C_DIM("   — no description —"))
     print(C_DIVIDER())
 
 # =============================================================================
-#  EXCEL SAVE (standardized column order)
+#  URL COLLECTION — GUEST API
+# =============================================================================
+
+def _build_guest_api_url(keyword: str, start: int) -> str:
+    kw = quote_plus(keyword)
+    return (
+        "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        f"?location=Libya&f_TPR=r604800&keywords={kw}&start={start}"
+    )
+
+def _collect_job_urls_from_cards(html: str, seen: set) -> list:
+    found = []
+    for raw_href in re.findall(r'href="(https?://[^"]*?/jobs/view/\d+[^"]*?)"', html):
+        c = canonicalise_job_url(raw_href)
+        if c and c not in seen: seen.add(c); found.append(c)
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        if "/jobs/view/" not in href: continue
+        if not href.startswith("http"): href = "https://www.linkedin.com" + href
+        c = canonicalise_job_url(href)
+        if c and c not in seen: seen.add(c); found.append(c)
+    for sel in ["a.base-card__full-link","a.base-main-card__full-link",
+                "a[data-tracking-control-name='public_jobs_jserp-name_click']",
+                "a.job-card-list__title","a.job-card-container__link"]:
+        for tag in soup.select(sel):
+            href = tag.get("href", "")
+            if "/jobs/view/" not in href: continue
+            if not href.startswith("http"): href = "https://www.linkedin.com" + href
+            c = canonicalise_job_url(href)
+            if c and c not in seen: seen.add(c); found.append(c)
+    return found
+
+def _fetch_guest_api_page(keyword: str, start: int, retries: int = 3) -> str | None:
+    url = _build_guest_api_url(keyword, start)
+    for attempt in range(retries):
+        try:
+            time.sleep(DELAY_S + attempt * 3)
+            r = requests.get(url, headers=_next_headers(), allow_redirects=True, timeout=25)
+            if r.status_code == 429:
+                wait = 60 + attempt * 60
+                print(C_RED(f"  ⏳ Rate limited (429) — waiting {wait}s ..."))
+                time.sleep(wait); continue
+            if r.status_code in (400, 403, 999):
+                log.warning(f"Blocked ({r.status_code}): {url}"); return None
+            if r.status_code != 200:
+                log.warning(f"HTTP {r.status_code}: {url}"); return None
+            text = r.text.strip()
+            if not text:
+                log.info(f"Empty body (start={start}, kw='{keyword}') — end of results.")
+                return None
+            return text
+        except Exception as e:
+            log.warning(f"Guest API error (attempt {attempt+1}, kw='{keyword}'): {e}")
+            time.sleep(3 + attempt * 3)
+    return None
+
+def _paginate_keyword(keyword: str, seen: set) -> list:
+    urls = []; page = 0; empty_streak = 0
+    label = keyword if keyword else "(all)"
+    while True:
+        if MAX_PAGES and page >= MAX_PAGES: break
+        start = page * 25
+        print(f"  {C_DIM(f'[{label}] page {page+1} (start={start}) ...')}", flush=True)
+        html = _fetch_guest_api_page(keyword, start)
+        if html is None: break
+        new_urls = _collect_job_urls_from_cards(html, seen)
+        log.info(f"[{label}] page {page+1}: {len(new_urls)} new (total seen={len(seen)})")
+        if new_urls: urls.extend(new_urls); empty_streak = 0
+        else:
+            empty_streak += 1
+            if empty_streak >= MAX_EMPTY_PAGES: break
+        if start >= 975: break
+        page += 1
+        if page % 10 == 0:
+            print(C_DIM("  Pausing 20s (every 10 pages) ..."))
+            time.sleep(20)
+    return urls
+
+# =============================================================================
+#  EXCEL SAVE  (standardized column order)
 # =============================================================================
 
 EXCEL_HEADERS = [
     "Job Title", "Job Type", "Job Qualifications", "Job Experience",
     "Job Location", "Job Field", "Date Posted", "Deadline",
     "Job Description", "Application", "Company URL", "Company Name",
-    "Company Logo", "Company Website", "Company Address",
-    "Company Details", "Job URL", "Salary Range",
+    "Company Logo", "Company Industry", "Company Founded", "Company Type",
+    "Company Website", "Company Address", "Company Details", "Job URL",
+    "Estimated Deadline", "Salary Range",
 ]
 
 def _save_excel(jobs: list):
-    if not _XLSX_AVAILABLE:
-        log_.warning("pandas/openpyxl not installed — skipping Excel export")
-        return
-    if not jobs:
-        return
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Sheet1"
+    ws.title = SHEET_NAME
     ws.append(EXCEL_HEADERS)
     for job in jobs:
         ws.append([
-            job["jobTitle"], job["jobType"], job["jobQualifications"], job["jobExperience"],
-            job["jobLocation"], job["jobField"], job["datePosted"], job["deadline"],
-            job["jobDescription"], job["application"], job["companyUrl"], job["companyName"],
-            job["companyLogo"], job["companyWebsite"], job["companyAddress"],
-            job["companyDetails"], job["jobUrl"], job["salaryRange"],
+            job["jobTitle"],
+            job["jobType"],
+            job["jobQualifications"],
+            job["jobExperience"],
+            job["jobLocation"],
+            job["jobField"],
+            job["datePosted"],
+            job["deadline"],
+            job["jobDescription"],
+            job["application"],
+            job["companyUrl"],
+            job["companyName"],
+            job["companyLogo"],
+            job["companyIndustry"],
+            job["companyFounded"],
+            job["companyType"],
+            job["companyWebsite"],
+            job["companyAddress"],
+            job["companyDetails"],
+            job["jobUrl"],
+            job["estimatedDeadline"],
+            job["salaryRange"],
         ])
     wb.save(OUTPUT_FILE)
-    log_.info(f"Saved {len(jobs)} rows -> {OUTPUT_FILE}")
+    log.info(f"Saved {len(jobs)} rows → {OUTPUT_FILE}")
 
 # =============================================================================
-#  MAIN
+#  MAIN CRAWL
 # =============================================================================
 
-def main():
-    start_time = datetime.now()
-
-    print()
-    print(C_HEADER("=" * 80))
-    print(C_HEADER("  LIBYANJOBS (LIBYA) SCRAPER + MISTRAL PARAPHRASE + WORDPRESS POSTING"))
-    print(C_HEADER("=" * 80))
-    print(f"  Jobs archive    : {JOBS_URL}")
-    print(f"  Fetch mode      : {'Playwright (forced)' if USE_PLAYWRIGHT else 'requests' + (' + Playwright fallback' if _PLAYWRIGHT_AVAILABLE else '')}")
-    print(f"  Public-apply    : {'✅ enforced (flag others)' if REQUIRE_PUBLIC_APPLY else '❌ off (post all)'}")
-    print(f"  Max new jobs    : {'unlimited' if not MAX_JOBS else MAX_JOBS}")
-    print(f"  Max pages       : {MAX_PAGES}")
-    print(f"  Paraphrase      : {'✅ enabled' if (ENABLE_PARAPHRASE and MISTRAL_API_KEY) else '❌ disabled'}")
-    print(f"  WordPress post  : {'✅ enabled' if (WP_USER and WP_PASSWORD) else '❌ disabled'}")
-    print(f"  Excel export    : {'✅ enabled' if _XLSX_AVAILABLE else '❌ disabled (pip install pandas openpyxl)'}")
-    print(f"  NLP gating      : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
-    print(f"  Started         : {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(C_HEADER("=" * 80))
-
+def craw():
+    start_time = time.time()
     _init_tracker()
-    _init_flagged()
-    processed_ids, processed_urls = load_processed_ids()
-    print(f"  Tracker loaded: {len(processed_ids)} previously processed job IDs")
 
-    try:
-        job_links = collect_job_links(JOBS_URL)
-    except Exception as e:
-        log(C_RED(f"  FATAL: could not collect job links: {e}"))
-        return
-
-    if not job_links:
-        log(C_RED("  No job links found — nothing to do."))
-        log(C_DIM("  If the site blocked the request, set USE_PLAYWRIGHT=1 and/or run from a residential IP."))
-        return
-    print(C_GREEN(f"\n  Found {len(job_links)} job detail page(s) to process.\n"))
-
-    jobs_out = []
-    seen_content = set()
-    posted_count = 0
-    flagged_count = 0
-    dup_count = 0
-    errors = 0
-    scraped = 0
-
-    for link in job_links:
-        if link in processed_urls:
-            dup_count += 1
-            log(C_DIM(f"  Already processed (tracker) — skipped: {link}"))
-            continue
-
-        try:
-            raw_job = scrape_job_detail(link)
-            scraped += 1
-        except Exception as e:
-            errors += 1
-            log(C_RED(f"  ERROR scraping {link} : {e}"))
-            time.sleep(REQUEST_DELAY)
-            continue
-
-        try:
-            status, job = process_job(raw_job, processed_ids, processed_urls, seen_content)
-        except Exception as e:
-            errors += 1
-            log(C_RED(f"  ERROR processing '{raw_job.get('title','')}' : {e}"))
-            continue
-
-        if status == "duplicate":
-            dup_count += 1
-            time.sleep(REQUEST_DELAY)
-            continue
-        if status == "flagged":
-            flagged_count += 1
-            time.sleep(REQUEST_DELAY)
-            continue
-
-        jobs_out.append(job)
-        print_job_verbose(len(jobs_out), job)
-
-        print(C_BLUE("\n  Posting to WordPress …"))
-        wp_id, wp_url = post_job_to_wordpress(job)
-        if wp_id:
-            mark_posted(job["_jobId"], wp_id, wp_url or "")
-            posted_count += 1
-            print(C_GREEN(f"  WP ID={wp_id}  {wp_url}"))
-        else:
-            mark_failed(job["_jobId"], "wp_post_failed_or_skipped")
-            print(C_RED("  WordPress post failed / skipped"))
-
-        if len(jobs_out) % 25 == 0:
-            _save_excel(jobs_out)
-
-        if MAX_JOBS and len(jobs_out) >= MAX_JOBS:
-            log(f"\nMAX_JOBS limit ({MAX_JOBS}) reached, stopping.")
-            break
-
-        time.sleep(REQUEST_DELAY)
-
-    _save_excel(jobs_out)
-
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds() / 60.0
     print()
-    print(C_HEADER("=" * 80))
+    print(C_HEADER("=" * 72))
+    print(C_HEADER("  LINKEDIN JOB SCRAPER v7 + MISTRAL PARAPHRASE"))
+    print(C_HEADER("=" * 72))
+    print(f"  Keywords      : {len(SEARCH_KEYWORDS)}")
+    print(f"  Max pages     : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
+    print(f"  Job cap       : {'none' if not JOB_LIMIT else JOB_LIMIT}")
+    print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'} (skipped for Arabic descriptions)")
+    print(f"  Apply/Website : ❌ LinkedIn URLs BLOCKED (blanked)")
+    print(f"  Company URL   : ✅ LinkedIn company page URL KEPT")
+    print(f"  Logo priority : company-website logo > LinkedIn logo")
+    print(f"  Company name  : LinkedIn page > job page > job-card > URL slug > website domain")
+    print(f"  Email cleanup : known-TLD truncation (fixes '.comtak' style junk)")
+    print(f"  NLP available : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
+    print(f"  Started       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(C_HEADER("=" * 72))
+
+    processed_ids, processed_urls = load_processed_ids()
+    print(f"  Tracker loaded: {len(processed_ids)} previously processed job IDs\n")
+
+    seen_urls = set(); all_job_urls = []; seen_content = set()
+
+    for qi, keyword in enumerate(SEARCH_KEYWORDS):
+        label = keyword if keyword else "(all)"
+        print()
+        print(C_BLUE(f"┌─ Keyword {qi+1}/{len(SEARCH_KEYWORDS)}: '{label}' ─────────────────"))
+        new_urls = _paginate_keyword(keyword, seen_urls)
+        all_job_urls.extend(new_urls)
+        print(C_BLUE(f"└─ Found {len(new_urls)} new jobs (running total: {len(all_job_urls)})"))
+        if JOB_LIMIT and len(all_job_urls) >= JOB_LIMIT: break
+        time.sleep(DELAY_S * 2)
+
+    if JOB_LIMIT and len(all_job_urls) > JOB_LIMIT:
+        all_job_urls = all_job_urls[:JOB_LIMIT]
+
+    print()
+    print(C_HEADER(f"  Total unique URLs collected: {len(all_job_urls)}"))
+    print()
+
+    jobs = []; errors = 0
+    for j, url in enumerate(all_job_urls):
+        print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(all_job_urls)} ...')}")
+        log.info(f"URL: {url}")
+        try:
+            job = scrape_job_details(url, processed_ids, processed_urls)
+            if job and job.get("jobTitle"):
+                fp = (
+                    (job.get("originalTitle") or "").lower().strip(),
+                    (job.get("companyName")   or "").lower().strip(),
+                    (job.get("jobLocation")   or "").lower().strip(),
+                )
+                if fp in seen_content:
+                    print(C_DIM(f"  ⧳  Duplicate content — skipped"))
+                else:
+                    seen_content.add(fp)
+                    jobs.append(job)
+                    print_job_verbose(job, j+1, len(all_job_urls))
+
+                    print(C_BLUE(f"\n  📤 Posting to WordPress …"))
+                    wp_id, wp_url = post_job_to_wordpress(job)
+                    if wp_id:
+                        mark_posted(job["_jobId"], wp_id, wp_url or "")
+                        print(C_GREEN(f"  ✅ WP ID={wp_id}  🔗 {wp_url}"))
+                    else:
+                        mark_failed(job["_jobId"], "wp_post_failed")
+                        print(C_RED("  ❌ WordPress post failed"))
+            else:
+                print(C_RED("  ✗  No title found / skipped"))
+        except Exception as e:
+            errors += 1
+            print(C_RED(f"  ✗  ERROR: {e}"))
+            log.warning(f"Job error: {e}")
+
+        time.sleep(DELAY_S)
+        if len(jobs) % 50 == 0 and len(jobs) > 0:
+            _save_excel(jobs)
+
+    _save_excel(jobs)
+
+    mins = round((time.time() - start_time) / 60, 1)
+    print()
+    print(C_HEADER("=" * 72))
     print(C_HEADER("  SCRAPE COMPLETE"))
-    print(C_HEADER("=" * 80))
-    print(f"  {C_LABEL('Job links found')}           : {len(job_links)}")
-    print(f"  {C_LABEL('Detail pages scraped')}      : {scraped}")
-    print(f"  {C_LABEL('New jobs processed')}        : {C_GREEN(str(len(jobs_out)))}")
-    print(f"  {C_LABEL('Posted to WordPress')}       : {C_GREEN(str(posted_count))}")
-    print(f"  {C_LABEL('Flagged (no public apply)')} : {flagged_count}")
-    print(f"  {C_LABEL('Duplicates skipped')}        : {dup_count}")
-    print(f"  {C_LABEL('Errors')}                    : {C_RED(str(errors)) if errors else '0'}")
-    print(f"  {C_LABEL('Duration')}                  : ~{duration:.1f} min")
-    print(f"  {C_LABEL('Output file')}               : {OUTPUT_FILE}")
-    print(f"  {C_LABEL('Tracker file')}              : {PROCESSED_IDS_FILE}")
-    print(f"  {C_LABEL('Flagged file')}              : {FLAGGED_FILE}")
+    print(C_HEADER("=" * 72))
+    print(f"  {C_LABEL('Total scraped')}  : {C_GREEN(str(len(jobs)))} jobs")
+    print(f"  {C_LABEL('Errors')}         : {C_RED(str(errors)) if errors else '0'}")
+    print(f"  {C_LABEL('Duration')}       : ~{mins} min")
+    print(f"  {C_LABEL('Output file')}    : {OUTPUT_FILE}")
+    print(f"  {C_LABEL('Tracker file')}   : {PROCESSED_IDS_FILE}")
 
-    if jobs_out:
-        with_apply = sum(1 for j in jobs_out if j.get("application"))
-        with_email = sum(1 for j in jobs_out if "@" in (j.get("application") or ""))
+    if jobs:
+        from collections import Counter
+
+        fields = Counter(j.get("jobField") or "Unknown" for j in jobs)
+        print(f"\n  {C_LABEL('Jobs by field:')}")
+        for field, count in fields.most_common():
+            print(f"    {field:<35} {'█'*min(count,40)} {count}")
+
+        with_apply = sum(1 for j in jobs if j.get("application"))
+        with_email = sum(1 for j in jobs if "@" in (j.get("application") or ""))
         with_url   = with_apply - with_email
+        no_apply   = len(jobs) - with_apply
         print(f"\n  {C_LABEL('Application links:')}")
-        print(f"    External URL : {with_url}")
+        print(f"    URL found    : {with_url}")
         print(f"    Email found  : {with_email}")
+        print(f"    Not found    : {no_apply}")
 
-        para_count = sum(1 for j in jobs_out if j.get("jobTitle") != j.get("originalTitle"))
-        print(f"\n  {C_LABEL('Paraphrased titles')} : {para_count}/{len(jobs_out)}")
+        methods = Counter(j.get("_apply_method", "unknown") for j in jobs)
+        print(f"\n  {C_LABEL('Apply method breakdown (v7):')}")
+        for method, count in methods.most_common():
+            print(f"    {method:<35} {count}")
 
-        with_deadline = sum(1 for j in jobs_out if j.get("deadline"))
-        print(f"  {C_LABEL('Deadline captured')}  : {with_deadline}/{len(jobs_out)}")
+        logo_sources = Counter(j.get("_logo_source", "unknown") for j in jobs if j.get("companyLogo"))
+        print(f"\n  {C_LABEL('Logo source breakdown:')}")
+        for src, count in logo_sources.most_common():
+            print(f"    {src:<25} {count}")
 
-    print(C_HEADER("=" * 80))
+        langs = Counter(j.get("_lang", "unknown") for j in jobs)
+        print(f"\n  {C_LABEL('Description language breakdown:')}")
+        for lang, count in langs.most_common():
+            print(f"    {lang:<10} {count}")
+
+        fill_fields = [("companyUrl","Company URL"),("companyName","Company Name"),
+                       ("companyIndustry","Company Industry"),("companyLogo","Company Logo"),
+                       ("companyWebsite","Company Website"),("companyAddress","Company Address"),
+                       ("companyFounded","Company Founded"),("companyDetails","Company Details")]
+        print(f"\n  {C_LABEL('Company field fill-rate:')}")
+        for key, label in fill_fields:
+            filled = sum(1 for j in jobs if j.get(key))
+            pct    = round(filled / len(jobs) * 100) if jobs else 0
+            print(f"    {label:<20} {filled}/{len(jobs)} ({pct}%)")
+
+        para_count = sum(1 for j in jobs if j.get("jobTitle") != j.get("originalTitle"))
+        print(f"\n  {C_LABEL('Paraphrased titles')} : {para_count}/{len(jobs)}")
+
+    print(C_HEADER("=" * 72))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(1)
+    craw()
