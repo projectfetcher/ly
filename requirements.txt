@@ -1,36 +1,8 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  libyanjobs.ly (Libya) scraper — Python dependencies
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Core (required) ──────────────────────────────────────────────────────────
-# HTTP + HTML parsing. lxml is NOT optional: the content-extraction step parses
-# with BeautifulSoup(..., "lxml") and has no html.parser fallback there.
-requests>=2.31
-beautifulsoup4>=4.12
-lxml>=5.0
-
-# ── Recommended ──────────────────────────────────────────────────────────────
-# Load WP_* / MISTRAL_API_KEY from a local .env (no-op if you inject env vars
-# directly, e.g. via GitHub Actions secrets).
-python-dotenv>=1.0
-
-# Excel export (libyanjobs_libya_jobs.xlsx). Without these, Excel export is
-# silently skipped; the CSV tracker + flagged CSV still work.
-pandas>=2.0
-openpyxl>=3.1
-
-# JS-render / WAF fallback. The site actively blocks automated + datacenter
-# requests, so Playwright is strongly recommended (set USE_PLAYWRIGHT=1).
-# After installing, you MUST also fetch the browser binary once:
-#     playwright install chromium
-playwright>=1.40
-
-# ── Optional: NLP paraphrase quality gate (HEAVY — off by default) ───────────
-# Enables grammar checking + semantic-similarity gating around the Mistral
-# paraphrase. sentence-transformers pulls in torch (hundreds of MB to GB) and
-# language-tool-python downloads a Java LanguageTool package — both make CI
-# very slow. The scraper detects their absence and simply skips this gate, so
-# leave them commented unless you specifically want it. Uncomment to enable:
-#
-# sentence-transformers>=2.2
-# language-tool-python>=2.7
+requests==2.33.1
+beautifulsoup4==4.14.3
+openpyxl==3.1.5
+lxml==5.3.0
+pandas>=2.0.0
+sentence-transformers>=2.7.0
+language-tool-python==2.7.1
+nltk>=3.8.0
